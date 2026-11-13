@@ -167,6 +167,7 @@ public sealed class ControllerBridge : IDisposable
                 BindingFlags.Public | BindingFlags.Instance);
             if (_submitReport == null)
                 AppLogger.Log("WARNING: SubmitReport not found.");
+            _virtual.FeedbackReceived += OnGameRumble;
             _virtual.Connect();
             Thread.Sleep(300);
 
@@ -265,6 +266,30 @@ public sealed class ControllerBridge : IDisposable
         }
         catch { }
         return null;
+    }
+
+    /// <summary>
+    /// Passes rumble from games (sent to the main virtual pad) to the physical pad. For a
+    /// DualSense, the physical pad is its feed controller, and DualSenseBridge relays the
+    /// feed's rumble to the DualSense itself.
+    /// </summary>
+    private void OnGameRumble(object? sender, Xbox360FeedbackReceivedEventArgs e)
+    {
+        SetPhysicalRumble(_xinput, e.LargeMotor, e.SmallMotor);
+    }
+
+    private static void SetPhysicalRumble(Controller? pad, byte large, byte small)
+    {
+        if (pad == null) return;
+        try
+        {
+            pad.SetVibration(new Vibration
+            {
+                LeftMotorSpeed = (ushort)(large * 257),  // low-frequency (strong) motor
+                RightMotorSpeed = (ushort)(small * 257), // high-frequency (weak) motor
+            });
+        }
+        catch { } // disconnected mid-call; the run loop handles reconnects
     }
 
     private Controller? FindPhysicalController()
@@ -415,6 +440,7 @@ public sealed class ControllerBridge : IDisposable
         _hidHideTimer?.Dispose();
         _windowWatcher?.Stop();
         lock (_desktopLock) _desktop?.Reset(); // release any held keys/buttons
+        SetPhysicalRumble(_xinput, 0, 0);
         _dualSense?.Dispose();
         HidHideManager.ReleaseAll(); // controllers behave normally once CouchControl exits
         _virtual?.Disconnect();

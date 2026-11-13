@@ -4,7 +4,8 @@ namespace CouchControl;
 /// Desktop mode settings, stored under "DesktopMode" in config.json.
 ///
 /// Button names: A B X Y LB RB LT RT Back Start LS RS DPadUp DPadDown DPadLeft DPadRight
-/// (DualSense: Cross=A, Circle=B, Square=X, Triangle=Y, Create/touchpad click=Back, Options=Start).
+/// (DualSense: Cross=A, Circle=B, Square=X, Triangle=Y, touchpad click=Back, Options=Start;
+/// the Create button isn't used).
 ///
 /// Actions:
 ///   LeftClick, RightClick, MiddleClick, X1Click, X2Click — held while the button is held
@@ -55,7 +56,7 @@ public sealed class DesktopModeSettings
         ["RB"] = "BrowserForward",
         ["LT"] = "Win+Down",
         ["RT"] = "Win+Up",
-        ["Back"] = "Esc",              // DualSense: touchpad click / Create
+        ["Back"] = "Esc",              // DualSense: touchpad click
         ["Start"] = "Enter",           // DualSense: Options
         ["DPadLeft"] = "Left",
         ["DPadRight"] = "Right",

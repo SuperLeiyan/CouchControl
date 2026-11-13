@@ -87,20 +87,27 @@ public sealed class DualSenseBridge : IDisposable
     /// <summary>One connected-controller session: create feed, pump reports, tear down.</summary>
     private void RunSession(string path, SafeFileHandle handle)
     {
-        int reportLength = GetInputReportLength(handle);
-        if (reportLength <= 0)
+        if (!TryGetCaps(handle, out var caps) || caps.InputReportByteLength <= 0)
         {
             AppLogger.Log("DualSense: could not read HID capabilities.");
             Sleep(2000);
             return;
         }
+        int reportLength = caps.InputReportByteLength;
 
         bool bluetooth = path.Contains("00001124", StringComparison.OrdinalIgnoreCase);
         AppLogger.Log($"DualSense connected ({(bluetooth ? "Bluetooth" : "USB/virtual")}, report {reportLength} bytes).");
 
+        // Rumble: games rumble the main virtual pad, ControllerBridge forwards that to the
+        // feed pad via XInput, and the feed's feedback is written to the DualSense here.
+        using var rumble = RumbleWriter.TryOpen(path, bluetooth, caps.OutputReportByteLength,
+            UsesVibrationV2(path, handle, caps.FeatureReportByteLength));
+
         var before = GetXUsbInstanceIds();
         var feed = _vigem.CreateXbox360Controller();
         feed.AutoSubmitReport = false;
+        if (rumble != null)
+            feed.FeedbackReceived += (_, e) => rumble.Set(e.LargeMotor, e.SmallMotor);
         feed.Connect();
 
         string? feedInstanceId = WaitForNewXUsbInstance(before);
@@ -158,6 +165,7 @@ public sealed class DualSenseBridge : IDisposable
             _handle = null;
             IsConnected = false;
             FeedSlot = -1;
+            rumble?.Stop();
             try
             {
                 ControllerBridge.WriteState(feed, ControllerState.Neutral);
@@ -207,16 +215,104 @@ public sealed class DualSenseBridge : IDisposable
         return h;
     }
 
-    private static int GetInputReportLength(SafeFileHandle handle)
+    private static bool TryGetCaps(SafeFileHandle handle, out HIDP_CAPS caps)
     {
-        if (!HidD_GetPreparsedData(handle, out IntPtr preparsed)) return -1;
-        try
-        {
-            return HidP_GetCaps(preparsed, out HIDP_CAPS caps) == HIDP_STATUS_SUCCESS
-                ? caps.InputReportByteLength
-                : -1;
-        }
+        caps = default;
+        if (!HidD_GetPreparsedData(handle, out IntPtr preparsed)) return false;
+        try { return HidP_GetCaps(preparsed, out caps) == HIDP_STATUS_SUCCESS; }
         finally { HidD_FreePreparsedData(preparsed); }
+    }
+
+    /// <summary>
+    /// Newer DualSense firmware (feature version ≥ 2.21) and every DualSense Edge use a
+    /// different rumble flag. Falls back to the new method if the version can't be read
+    /// (e.g. a virtual DualSense from a stream), since nearly all controllers are updated.
+    /// </summary>
+    private static bool UsesVibrationV2(string path, SafeFileHandle handle, int featureLength)
+    {
+        if (path.Contains("0df2", StringComparison.OrdinalIgnoreCase)) return true; // Edge
+        if (featureLength < 46) return true;
+
+        var buf = new byte[featureLength];
+        buf[0] = 0x20; // firmware info
+        if (!HidD_GetFeature(handle, buf, buf.Length)) return true;
+
+        var version = DualSenseReport.ParseUpdateVersion(buf);
+        bool v2 = version is null || version >= DualSenseReport.VibrationV2MinVersion;
+        AppLogger.Log($"DualSense feature version 0x{version ?? 0:X4}; rumble method {(v2 ? "v2" : "v1")}.");
+        return v2;
+    }
+
+    /// <summary>Writes rumble output reports to a DualSense on its own write handle.</summary>
+    private sealed class RumbleWriter : IDisposable
+    {
+        private readonly SafeFileHandle _handle;
+        private readonly bool _bluetooth, _vibrationV2;
+        private readonly int _length;
+        private readonly object _lock = new();
+        private byte _seq;
+        private int _last = -1; // last (large << 8 | small) sent
+        private bool _loggedFailure, _disposed;
+
+        private RumbleWriter(SafeFileHandle handle, bool bluetooth, bool vibrationV2, int length)
+        {
+            _handle = handle; _bluetooth = bluetooth; _vibrationV2 = vibrationV2; _length = length;
+        }
+
+        public static RumbleWriter? TryOpen(string path, bool bluetooth, int outputLength, bool vibrationV2)
+        {
+            int needed = bluetooth ? DualSenseReport.BtOutputReportSize : DualSenseReport.UsbOutputReportSize;
+            if (outputLength < needed)
+            {
+                AppLogger.Log($"DualSense: output report too short ({outputLength} bytes); rumble disabled.");
+                return null;
+            }
+
+            var h = CreateFile(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (h.IsInvalid)
+            {
+                int err = Marshal.GetLastWin32Error();
+                h.Dispose();
+                AppLogger.Log($"DualSense: can't open for writing ({new Win32Exception(err).Message}); rumble disabled.");
+                return null;
+            }
+            return new RumbleWriter(h, bluetooth, vibrationV2, outputLength);
+        }
+
+        public void Set(byte large, byte small)
+        {
+            lock (_lock)
+            {
+                if (_disposed) return;
+                int key = large << 8 | small;
+                if (key == _last) return; // games resend the same values constantly
+                var report = DualSenseReport.BuildRumbleReport(_bluetooth, _vibrationV2, large, small, _seq, _length);
+                _seq = (byte)((_seq + 1) & 0x0F);
+                if (WriteFile(_handle, report, (uint)report.Length, out _, IntPtr.Zero))
+                {
+                    _last = key;
+                    _loggedFailure = false;
+                }
+                else if (!_loggedFailure)
+                {
+                    _loggedFailure = true;
+                    AppLogger.Log($"DualSense rumble write failed ({new Win32Exception(Marshal.GetLastWin32Error()).Message}).");
+                }
+            }
+        }
+
+        public void Stop() => Set(0, 0);
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _handle.Dispose();
+            }
+        }
     }
 
     private static HashSet<string> GetXUsbInstanceIds()
@@ -302,6 +398,13 @@ public sealed class DualSenseBridge : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ReadFile(SafeFileHandle hFile, [Out] byte[] lpBuffer, uint nNumberOfBytesToRead,
         out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteFile(SafeFileHandle hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite,
+        out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
+
+    [DllImport("hid.dll", SetLastError = true)]
+    private static extern bool HidD_GetFeature(SafeFileHandle hidDeviceObject, byte[] reportBuffer, int reportBufferLength);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CancelIoEx(SafeFileHandle hFile, IntPtr lpOverlapped);
