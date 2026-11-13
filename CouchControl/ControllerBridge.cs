@@ -164,50 +164,11 @@ public sealed class ControllerBridge : IDisposable
             if (_manageHidHide)
                 HidHideManager.HidePhysicalControllers();
 
-            // Connect virtual controller next.
-            // If CouchControl starts before physical controllers connect (e.g. at Windows startup
-            // via "Start with Windows"), the virtual controller claims slot 0 automatically.
-            // If a physical pad already holds slot 0, briefly disable it so the virtual
-            // controller claims slot 0 (player 1) regardless of startup order.
-            var freed = SlotZeroClaimer.FreeSlotZero();
-            try
-            {
-                var before = ConnectedSlots();
-                _vigem = new ViGEmClient();
-                _virtual = _vigem.CreateXbox360Controller();
-                _submitReport = _virtual.GetType().GetMethod("SubmitReport",
-                    BindingFlags.Public | BindingFlags.Instance);
-                if (_submitReport == null)
-                    AppLogger.Log("WARNING: SubmitReport not found.");
-                _virtual.FeedbackReceived += OnGameRumble;
-                _virtual.Connect();
-
-                // The virtual controller is whichever slot appears after connecting it.
-                for (int i = 0; i < 20 && _virtualSlot == -1; i++)
-                {
-                    Thread.Sleep(100);
-                    var added = ConnectedSlots().Except(before).ToList();
-                    if (added.Count > 0) _virtualSlot = added.Min();
-                }
-            }
-            finally
-            {
-                // The physical pad comes back into a later slot; the run loop picks it up.
-                SlotZeroClaimer.Restore(freed);
-            }
-
-            if (_virtualSlot == -1)
-            {
-                // Fallback: ViGEm virtual controllers have no XInput instance ID; physical ones do.
-                _virtualSlot = ConnectedSlots().FirstOrDefault(s => FindXInputInstanceId(s) == null, -1);
-                AppLogger.Log(_virtualSlot >= 0
-                    ? $"Virtual controller on slot {_virtualSlot} (found by instance ID)."
-                    : "WARNING: could not tell which slot the virtual controller is on.");
-            }
-            else
-            {
-                AppLogger.Log($"Virtual controller on slot {_virtualSlot}.");
-            }
+            // Connect the virtual controller next. XInput gives it the first free slot, so it
+            // only becomes player 1 (slot 0) if no physical pad is on slot 0 yet. If one is,
+            // the run loop moves it to slot 0 once that slot frees up (see ReclaimSlotZero).
+            _vigem = new ViGEmClient();
+            ConnectVirtual();
 
             _xinput = FindPhysicalController();
             AppLogger.Log(_xinput != null
@@ -217,7 +178,8 @@ public sealed class ControllerBridge : IDisposable
             if (_virtualSlot == 0)
                 AppLogger.Log("Virtual controller on slot 0 — all games will see it correctly.");
             else
-                AppLogger.Log($"Virtual controller on slot {_virtualSlot}. Enable 'Start with Windows' in the tray menu for automatic slot 0.");
+                AppLogger.Log($"Virtual controller on slot {_virtualSlot}: a controller was already on slot 0. " +
+                    "Turn it off and on again and CouchControl will move to slot 0.");
 
             // Window watcher — auto-mutes when a configured process is in the foreground
             _windowWatcher = new WindowWatcher(
@@ -301,6 +263,85 @@ public sealed class ControllerBridge : IDisposable
         catch { } // disconnected mid-call; the run loop handles reconnects
     }
 
+    /// <summary>Creates and connects the virtual controller and works out which slot it got.</summary>
+    private void ConnectVirtual()
+    {
+        var before = ConnectedSlots();
+        var pad = _vigem!.CreateXbox360Controller();
+        _submitReport ??= pad.GetType().GetMethod("SubmitReport", BindingFlags.Public | BindingFlags.Instance);
+        if (_submitReport == null)
+            AppLogger.Log("WARNING: SubmitReport not found.");
+        pad.FeedbackReceived += OnGameRumble;
+        pad.Connect();
+        _virtual = pad;
+
+        // The virtual controller is whichever slot appears after connecting it.
+        _virtualSlot = -1;
+        for (int i = 0; i < 20 && _virtualSlot == -1; i++)
+        {
+            Thread.Sleep(100);
+            var added = ConnectedSlots().Except(before).ToList();
+            if (added.Count > 0) _virtualSlot = added.Min();
+        }
+
+        if (_virtualSlot == -1)
+        {
+            // Fallback: ViGEm virtual controllers have no XInput instance ID; physical ones do.
+            _virtualSlot = ConnectedSlots().FirstOrDefault(s => FindXInputInstanceId(s) == null, -1);
+            AppLogger.Log(_virtualSlot >= 0
+                ? $"Virtual controller on slot {_virtualSlot} (found by instance ID)."
+                : "WARNING: could not tell which slot the virtual controller is on.");
+        }
+        else
+        {
+            AppLogger.Log($"Virtual controller on slot {_virtualSlot}.");
+        }
+    }
+
+    private long _nextSlotZeroCheck;
+
+    /// <summary>
+    /// If the virtual controller isn't on slot 0 and slot 0 has become free (e.g. the
+    /// physical pad holding it was switched off), reconnect the virtual controller so it
+    /// takes slot 0. The physical pad then gets a later slot when it comes back.
+    /// Checked at most once a second on the poll thread.
+    /// </summary>
+    private void ReclaimSlotZero()
+    {
+        if (_virtualSlot <= 0 || _vigem == null) return; // already slot 0, or slot unknown
+        long now = Environment.TickCount64;
+        if (now < _nextSlotZeroCheck) return;
+        _nextSlotZeroCheck = now + 1000;
+        if (new Controller(UserIndex.One).IsConnected) return;
+
+        AppLogger.Log($"Slot 0 is free; moving the virtual controller there from slot {_virtualSlot}.");
+        var old = _virtual;
+        _virtual = null;
+        try
+        {
+            if (old != null)
+            {
+                old.FeedbackReceived -= OnGameRumble;
+                WriteState(old, ControllerState.Neutral);
+                _submitReport?.Invoke(old, null);
+                old.Disconnect();
+            }
+            // Give XInput a moment to release the old slot.
+            for (int i = 0; i < 10 && _virtualSlot >= 0 && new Controller((UserIndex)_virtualSlot).IsConnected; i++)
+                Thread.Sleep(50);
+            ConnectVirtual();
+            if (_xinput != null && (int)_xinput.UserIndex == _virtualSlot) _xinput = null; // stale handle
+            SlotChanged?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"Moving the virtual controller failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Raised (on the poll thread) after the virtual controller moves to another slot.</summary>
+    public event Action? SlotChanged;
+
     private static List<int> ConnectedSlots()
     {
         var slots = new List<int>();
@@ -340,6 +381,7 @@ public sealed class ControllerBridge : IDisposable
         {
             try
             {
+                ReclaimSlotZero();
                 if (!TryReadInput(out var raw, out var source))
                 {
                     SetSource(InputSource.None);

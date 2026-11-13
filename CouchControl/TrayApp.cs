@@ -152,6 +152,17 @@ public sealed class TrayApp : IDisposable
 
         MergeConvertedBlockList();
 
+        if (_bridge.VirtualSlot != 0)
+            _trayIcon.ShowBalloonTip(6000, "CouchControl",
+                "Your controller was on before CouchControl started, so games may not see CouchControl as player 1. " +
+                "Turn the controller off and on again to fix this.",
+                ToolTipIcon.Info);
+        _bridge.SlotChanged += () => _ui.Post(_ =>
+        {
+            if (_bridge.VirtualSlot == 0)
+                _trayIcon.ShowBalloonTip(2000, "CouchControl", "CouchControl is now player 1.", ToolTipIcon.None);
+        }, null);
+
         // Run the bridge loop on a background task
         _ = Task.Run(() => _bridge.RunAsync(_cts.Token));
 
