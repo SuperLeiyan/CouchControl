@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <!-- Allows building the net8.0-windows projects on Linux/macOS (e.g. Kiro Web, CI).
+         Has no effect on Windows. The app and tests still only run on Windows. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+</Project>

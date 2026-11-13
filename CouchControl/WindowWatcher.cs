@@ -80,10 +80,13 @@ public sealed class WindowWatcher
         {
             var proc = Process.GetProcessById((int)pid);
             if (proc.Id == Environment.ProcessId) return false;
-            var name = proc.ProcessName;
-            return processes.Any(p => name.Equals(p, StringComparison.OrdinalIgnoreCase))
-                || (windowsUi && WindowsUiProcesses.Any(p => name.Equals(p, StringComparison.OrdinalIgnoreCase)));
+            return IsMuteProcess(proc.ProcessName, processes, windowsUi);
         }
         catch { return false; }
     }
+
+    /// <summary>True if <paramref name="processName"/> should mute games (case-insensitive).</summary>
+    internal static bool IsMuteProcess(string processName, IReadOnlyList<string> autoMuteProcesses, bool muteOnWindowsUi)
+        => autoMuteProcesses.Any(p => processName.Equals(p, StringComparison.OrdinalIgnoreCase))
+        || (muteOnWindowsUi && WindowsUiProcesses.Any(p => processName.Equals(p, StringComparison.OrdinalIgnoreCase)));
 }

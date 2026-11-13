@@ -1,0 +1,47 @@
+name: Build and test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          # 9.0 SDK reads the .slnx solution; 8.0 runtime runs the net8.0 tests.
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Restore
+        run: dotnet restore CouchControl.slnx
+
+      - name: Test
+        run: dotnet test CouchControl.slnx --configuration Release --no-restore --logger "trx;LogFileName=results.trx" --results-directory TestResults
+
+      - name: Publish app
+        run: dotnet publish CouchControl/CouchControl.csproj --configuration Release --runtime win-x64 --self-contained false --output publish
+
+      - name: Upload app
+        uses: actions/upload-artifact@v7
+        with:
+          name: CouchControl-${{ github.sha }}
+          path: publish/
+          retention-days: 14
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: TestResults/
+          retention-days: 14

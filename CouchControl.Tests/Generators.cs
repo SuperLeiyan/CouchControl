@@ -1,73 +1,58 @@
 using FsCheck;
-using SharpDX.DirectInput;
-using System.Reflection;
+using SharpDX.XInput;
 
 namespace CouchControl.Tests;
-
-/// <summary>
-/// Plain data record mirroring the JoystickState fields used by ControllerBridge.BuildReport.
-/// Used as the generator input type since JoystickState has no public parameterized constructor.
-/// </summary>
-public record JoystickStateData(
-    int X,
-    int Y,
-    int RotationX,
-    int RotationY,
-    int Z,
-    bool[] Buttons,       // length 11
-    int[] PointOfViewControllers); // length 1, -1 = centered
 
 /// <summary>
 /// FsCheck generators for test input types.
 /// </summary>
 public static class Generators
 {
-    private static readonly Gen<int> AxisGen = Gen.Choose(0, 65535);
-    private static readonly Gen<bool> BoolGen = Arb.Generate<bool>();
+    private static readonly Gen<short> AxisGen =
+        Gen.Choose(short.MinValue, short.MaxValue).Select(v => (short)v);
 
-    public static Arbitrary<JoystickStateData> JoystickStateArbitrary()
+    private static readonly Gen<byte> TriggerGen =
+        Gen.Choose(0, 255).Select(v => (byte)v);
+
+    // Every button flag XInput can report (Guide isn't exposed by XInput's public API).
+    private static readonly GamepadButtonFlags[] AllButtons =
+    [
+        GamepadButtonFlags.DPadUp, GamepadButtonFlags.DPadDown,
+        GamepadButtonFlags.DPadLeft, GamepadButtonFlags.DPadRight,
+        GamepadButtonFlags.Start, GamepadButtonFlags.Back,
+        GamepadButtonFlags.LeftThumb, GamepadButtonFlags.RightThumb,
+        GamepadButtonFlags.LeftShoulder, GamepadButtonFlags.RightShoulder,
+        GamepadButtonFlags.A, GamepadButtonFlags.B,
+        GamepadButtonFlags.X, GamepadButtonFlags.Y,
+    ];
+
+    private static readonly Gen<GamepadButtonFlags> ButtonsGen =
+        Gen.ArrayOf(AllButtons.Length, Arb.Generate<bool>()).Select(bits =>
+        {
+            var flags = GamepadButtonFlags.None;
+            for (int i = 0; i < AllButtons.Length; i++)
+                if (bits[i]) flags |= AllButtons[i];
+            return flags;
+        });
+
+    public static Arbitrary<Gamepad> GamepadArbitrary()
     {
         var gen =
-            from x  in AxisGen
-            from y  in AxisGen
+            from lx in AxisGen
+            from ly in AxisGen
             from rx in AxisGen
             from ry in AxisGen
-            from z  in AxisGen
-            from b0  in BoolGen from b1  in BoolGen from b2  in BoolGen
-            from b3  in BoolGen from b4  in BoolGen from b5  in BoolGen
-            from b6  in BoolGen from b7  in BoolGen from b8  in BoolGen
-            from b9  in BoolGen from b10 in BoolGen
-            // POV: -1 (centered) or one of the 8 cardinal/diagonal angles in hundredths of degrees
-            from pov in Gen.Elements(-1, 0, 4500, 9000, 13500, 18000, 22500, 27000, 31500)
-            select new JoystickStateData(
-                X: x, Y: y, RotationX: rx, RotationY: ry, Z: z,
-                Buttons: [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10],
-                PointOfViewControllers: [pov]);
+            from lt in TriggerGen
+            from rt in TriggerGen
+            from buttons in ButtonsGen
+            select new Gamepad
+            {
+                LeftThumbX = lx, LeftThumbY = ly,
+                RightThumbX = rx, RightThumbY = ry,
+                LeftTrigger = lt, RightTrigger = rt,
+                Buttons = buttons,
+            };
 
         return gen.ToArbitrary();
-    }
-
-    /// <summary>
-    /// Converts a <see cref="JoystickStateData"/> to a real <see cref="JoystickState"/>
-    /// via reflection so it can be passed to ControllerBridge.BuildReport.
-    /// </summary>
-    public static JoystickState ToJoystickState(JoystickStateData data)
-    {
-        var state = new JoystickState();
-        SetField(state, "<X>k__BackingField",                      data.X);
-        SetField(state, "<Y>k__BackingField",                      data.Y);
-        SetField(state, "<RotationX>k__BackingField",              data.RotationX);
-        SetField(state, "<RotationY>k__BackingField",              data.RotationY);
-        SetField(state, "<Z>k__BackingField",                      data.Z);
-        SetField(state, "<Buttons>k__BackingField",                data.Buttons);
-        SetField(state, "<PointOfViewControllers>k__BackingField", data.PointOfViewControllers);
-        return state;
-    }
-
-    private static void SetField(object obj, string name, object value)
-    {
-        var field = obj.GetType().GetField(name,
-            BindingFlags.NonPublic | BindingFlags.Instance);
-        field?.SetValue(obj, value);
     }
 }
