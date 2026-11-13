@@ -166,15 +166,26 @@ public sealed class ControllerBridge : IDisposable
             // Connect virtual controller next.
             // If CouchControl starts before physical controllers connect (e.g. at Windows startup
             // via "Start with Windows"), the virtual controller claims slot 0 automatically.
-            _vigem = new ViGEmClient();
-            _virtual = _vigem.CreateXbox360Controller();
-            _submitReport = _virtual.GetType().GetMethod("SubmitReport",
-                BindingFlags.Public | BindingFlags.Instance);
-            if (_submitReport == null)
-                AppLogger.Log("WARNING: SubmitReport not found.");
-            _virtual.FeedbackReceived += OnGameRumble;
-            _virtual.Connect();
-            Thread.Sleep(300);
+            // If a physical pad already holds slot 0, briefly disable it so the virtual
+            // controller claims slot 0 (player 1) regardless of startup order.
+            var freed = SlotZeroClaimer.FreeSlotZero();
+            try
+            {
+                _vigem = new ViGEmClient();
+                _virtual = _vigem.CreateXbox360Controller();
+                _submitReport = _virtual.GetType().GetMethod("SubmitReport",
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (_submitReport == null)
+                    AppLogger.Log("WARNING: SubmitReport not found.");
+                _virtual.FeedbackReceived += OnGameRumble;
+                _virtual.Connect();
+                Thread.Sleep(300);
+            }
+            finally
+            {
+                // The re-enabled pad reconnects into a later slot; the run loop picks it up.
+                SlotZeroClaimer.Restore(freed);
+            }
 
             // Identify virtual vs physical slots.
             // ViGEm virtual controllers have no XInput instance ID; physical controllers do.
