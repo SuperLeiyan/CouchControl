@@ -20,10 +20,10 @@ public sealed class AppConfig
     /// <summary>Whether CouchControl starts automatically with Windows.</summary>
     public bool StartWithWindows { get; set; } = false;
 
-    /// <summary>Guide/PS button: tap toggles the touch keyboard, double-tap shows the desktop.</summary>
+    /// <summary>Guide/PS button: a press toggles the touch keyboard.</summary>
     public bool GuideButtonActions { get; set; } = true;
 
-    /// <summary>DualSense touchpad: long touch toggles the touch keyboard, double-tap shows the desktop.</summary>
+    /// <summary>DualSense touchpad: a tap (touch without clicking) toggles the touch keyboard.</summary>
     public bool TouchpadGestures { get; set; } = true;
 
     /// <summary>

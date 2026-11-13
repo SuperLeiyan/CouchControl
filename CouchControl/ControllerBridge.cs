@@ -225,7 +225,6 @@ public sealed class ControllerBridge : IDisposable
             // while it's on.
             _desktop = new DesktopMapper(InputSender.Instance, RunOneShot, _desktopSettings);
             _desktop.ModeChanged += OnDesktopModeChanged;
-            if (_desktop.IsActive) OnDesktopModeChanged(true);
             AppLogger.Log($"Desktop mode ready (toggle: {_desktopSettings.ToggleChord}).");
 
             // DualSense → Xbox 360 feed controller. The run loop picks the feed up as a
@@ -314,6 +313,8 @@ public sealed class ControllerBridge : IDisposable
                         continue;
                     }
                     AppLogger.Log($"Controller reconnected on slot {(int)_xinput.UserIndex}.");
+                    // A newly connected controller always starts in controller (game) mode.
+                    lock (_desktopLock) _desktop?.SetActive(false);
                 }
 
                 _xinput.GetState(out var state);

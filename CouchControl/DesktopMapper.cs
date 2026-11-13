@@ -40,7 +40,7 @@ internal sealed class DesktopMapper
         _sink = sink;
         _oneShot = oneShot;
         ApplySettings(settings);
-        IsActive = settings.Enabled && settings.StartInDesktopMode;
+        IsActive = false; // always start in controller (game) mode
     }
 
     public void ApplySettings(DesktopModeSettings settings)

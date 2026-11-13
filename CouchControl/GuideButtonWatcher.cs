@@ -6,8 +6,7 @@ namespace CouchControl;
 /// <summary>
 /// Ported from GuideTray. Watches every XInput slot for the Guide button (Xbox button,
 /// or the DualSense PS button via the DualSense feed controller):
-///   single tap  → toggle the Windows touch keyboard
-///   double tap  → show desktop
+///   press       → toggle the Windows touch keyboard (fires on release)
 ///   long press  → ignored (≥ 1 s, e.g. holding to power the controller off)
 ///
 /// CouchControl is on HidHide's allow list, so it sees hidden physical pads and the
@@ -17,7 +16,6 @@ public sealed class GuideButtonWatcher : IDisposable
 {
     private const ushort GuideButton = 0x0400;
     private const int LongPressThresholdMs = 1000;
-    private const int DoubleTapWindowMs = 400;
     private const int PollIntervalMs = 50;
 
     private readonly Func<bool> _isEnabled;
@@ -39,8 +37,6 @@ public sealed class GuideButtonWatcher : IDisposable
     {
         bool wasPressed = false;
         DateTime pressedAt = DateTime.MinValue;
-        DateTime lastReleaseAt = DateTime.MinValue;
-        int tapCount = 0;
 
         while (_running)
         {
@@ -53,26 +49,7 @@ public sealed class GuideButtonWatcher : IDisposable
                     pressedAt = now;
 
                 if (!guideDown && wasPressed && (now - pressedAt).TotalMilliseconds < LongPressThresholdMs)
-                {
-                    if ((now - lastReleaseAt).TotalMilliseconds <= DoubleTapWindowMs)
-                    {
-                        tapCount = 0;
-                        lastReleaseAt = DateTime.MinValue;
-                        Fire("double tap → show desktop", ShowDesktop);
-                    }
-                    else
-                    {
-                        tapCount = 1;
-                        lastReleaseAt = now;
-                    }
-                }
-
-                // Single tap confirmed once the double-tap window has expired.
-                if (tapCount == 1 && (now - lastReleaseAt).TotalMilliseconds > DoubleTapWindowMs)
-                {
-                    tapCount = 0;
-                    Fire("tap → touch keyboard", TouchKeyboard.Toggle);
-                }
+                    Fire("press → touch keyboard", TouchKeyboard.Toggle);
 
                 wasPressed = guideDown;
             }

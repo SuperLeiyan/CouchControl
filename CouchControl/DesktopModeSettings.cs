@@ -24,7 +24,6 @@ public sealed class DesktopModeSettings
     /// </summary>
     public string ToggleChord { get; set; } = "Back+Start";
 
-    public bool StartInDesktopMode { get; set; } = false;
     public bool PlaySoundOnSwitch { get; set; } = true;
 
     /// <summary>Cursor speed in pixels per second at full stick deflection.</summary>
@@ -43,27 +42,27 @@ public sealed class DesktopModeSettings
     public string RightStick { get; set; } = "Scroll"; // Mouse | Scroll | None
 
     /// <summary>
-    /// Defaults use the same actions as the JoyXoff desktop profile this replaces. JoyXoff's
-    /// file doesn't say which face button is which, so the face-button positions are a best guess.
+    /// Button → action map. Win+Down restores a maximized window or minimizes it;
+    /// Win+Up maximizes it. BrowserBack/BrowserForward also work in File Explorer.
     /// </summary>
     public Dictionary<string, string> Buttons { get; set; } = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["A"] = "LeftClick",
-        ["B"] = "RightClick",
-        ["X"] = "Esc",
-        ["Y"] = "Enter",
-        ["LB"] = "Win+Tab",
-        ["RB"] = "Win",
-        ["LT"] = "BrowserBack",
-        ["RT"] = "BrowserForward",
-        ["Back"] = "Win+Down",
-        ["Start"] = "Win+Up",
+        ["A"] = "LeftClick",           // Cross
+        ["B"] = "RightClick",          // Circle
+        ["X"] = "Win+Tab",             // Square: Task View
+        ["Y"] = "Win",                 // Triangle: Start menu
+        ["LB"] = "BrowserBack",
+        ["RB"] = "BrowserForward",
+        ["LT"] = "Win+Down",
+        ["RT"] = "Win+Up",
+        ["Back"] = "Esc",              // DualSense: touchpad click / Create
+        ["Start"] = "Enter",           // DualSense: Options
         ["DPadLeft"] = "Left",
         ["DPadRight"] = "Right",
         ["DPadDown"] = "Down",
         ["DPadUp"] = "Up",
-        ["LS"] = "Ctrl+W",
-        ["RS"] = "MiddleClick",
+        ["LS"] = "MiddleClick",
+        ["RS"] = "Win+W",              // Widgets
     };
 }
 

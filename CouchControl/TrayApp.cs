@@ -208,7 +208,7 @@ public sealed class TrayApp : IDisposable
         {
             Checked = _config.GuideButtonActions,
             CheckOnClick = true,
-            ToolTipText = "Tap: toggle touch keyboard. Double-tap: show desktop."
+            ToolTipText = "Press: toggle touch keyboard."
         };
         guideItem.CheckedChanged += (_, _) =>
         {
@@ -223,7 +223,7 @@ public sealed class TrayApp : IDisposable
         {
             Checked = _config.TouchpadGestures,
             CheckOnClick = true,
-            ToolTipText = "Long touch: toggle touch keyboard. Double-tap: show desktop."
+            ToolTipText = "Tap (without clicking): toggle touch keyboard."
         };
         touchpadItem.CheckedChanged += (_, _) =>
         {
@@ -456,16 +456,10 @@ public sealed class TrayApp : IDisposable
         if (Interlocked.Exchange(ref _gestureBusy, 1) == 1) return;
         try
         {
-            switch (gesture)
+            if (gesture == TouchpadGesture.Tap)
             {
-                case TouchpadGesture.LongTouch:
-                    AppLogger.Log("Touchpad: long touch → touch keyboard");
-                    TouchKeyboard.Toggle();
-                    break;
-                case TouchpadGesture.DoubleTap:
-                    AppLogger.Log("Touchpad: double tap → show desktop");
-                    GuideButtonWatcher.ShowDesktop();
-                    break;
+                AppLogger.Log("Touchpad: tap → touch keyboard");
+                TouchKeyboard.Toggle();
             }
         }
         finally { Interlocked.Exchange(ref _gestureBusy, 0); }
