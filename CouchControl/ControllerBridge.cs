@@ -394,16 +394,16 @@ public sealed class ControllerBridge : IDisposable
                 double dt = Math.Clamp(pollClock.Elapsed.TotalSeconds, 0, 0.05);
                 pollClock.Restart();
 
-                // Windows' touch keyboard reads Xbox controllers itself, but it only sees a
-                // DualSense through the virtual pad. While it's open, a DualSense drives the
-                // keyboard: the virtual pad stays live and desktop mode pauses.
-                bool keyboardNav = source == InputSource.DualSense && TouchKeyboard.IsVisible;
+                // The physical pads are hidden, so the touch keyboard only sees the virtual pad.
+                // While it's open, the controller drives the keyboard: the virtual pad stays
+                // live (even when games are muted) and desktop mode pauses.
+                bool keyboardNav = TouchKeyboard.IsVisible;
                 if (keyboardNav != _keyboardNav)
                 {
                     _keyboardNav = keyboardNav;
                     AppLogger.Log(keyboardNav
-                        ? "Touch keyboard open: DualSense now drives the keyboard."
-                        : "Touch keyboard closed: DualSense back to normal.");
+                        ? "Touch keyboard open: controller now drives the keyboard."
+                        : "Touch keyboard closed: controller back to normal.");
                 }
 
                 lock (_desktopLock)
