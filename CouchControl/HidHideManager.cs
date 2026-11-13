@@ -13,9 +13,12 @@ namespace CouchControl;
 ///  • Physical controllers (when "Manage HidHide" is on) — hides real Xbox/XInput pads
 ///    and DualSense controllers so games only see CouchControl's virtual controller.
 ///
-/// Only instance IDs CouchControl added itself are tracked as "owned". Owned entries are
-/// removed when CouchControl exits (so controllers behave normally without it) and on the
-/// next start after a crash. Devices the user hid manually are left alone.
+/// Only instance IDs CouchControl added itself are tracked as "owned". Owned entries stay
+/// hidden after CouchControl exits: HidHide can't take a device away from an app that
+/// opened it while it was visible (Windows components do this within moments), so
+/// un-hiding between runs would let them read the physical pad past the mute again.
+/// They're re-adopted on the next start, and un-hidden when "Manage HidHide" is turned
+/// off. Devices the user hid manually are left alone.
 /// </summary>
 internal static class HidHideManager
 {
@@ -37,7 +40,7 @@ internal static class HidHideManager
     {
         lock (Sync)
         {
-            RemoveStaleEntries();
+            LoadOwnedEntries(keep: manage);
 
             try
             {
@@ -84,8 +87,23 @@ internal static class HidHideManager
 
     // ── Physical controllers ──────────────────────────────────────────────
 
+    /// <summary>
+    /// Raised (outside the lock, on the caller's thread) with the kinds of controllers that
+    /// were just hidden while already connected. Windows may have opened them while they
+    /// were visible, so they need reconnecting once for the hiding to fully take effect.
+    /// </summary>
+    public static event Action<IReadOnlyList<string>>? ConnectedControllersHidden;
+
     /// <summary>Hides any present physical XInput pad or DualSense not already hidden.</summary>
     public static void HidePhysicalControllers()
+    {
+        var newlyHidden = new List<string>();
+        HidePhysicalControllersLocked(newlyHidden);
+        if (newlyHidden.Count > 0)
+            ConnectedControllersHidden?.Invoke(newlyHidden.Distinct().ToList());
+    }
+
+    private static void HidePhysicalControllersLocked(List<string> newlyHidden)
     {
         lock (Sync)
         {
@@ -97,9 +115,12 @@ internal static class HidHideManager
                 foreach (var (id, kind) in FindPhysicalControllers())
                 {
                     if (blocked.Contains(id)) continue;
-                    svc.AddBlockedInstanceId(id);
+                    // Record ownership before hiding, so a crash in between can't leave an
+                    // entry hidden that CouchControl doesn't know about.
                     OwnedDevices.Add(id);
                     SaveOwned();
+                    svc.AddBlockedInstanceId(id);
+                    newlyHidden.Add(kind.StartsWith("Xbox", StringComparison.Ordinal) ? "Xbox controller" : kind);
                     AppLogger.Log($"HidHide: hid {kind} {id} from games.");
                 }
             }
@@ -133,12 +154,6 @@ internal static class HidHideManager
             foreach (var id in OwnedDevices.ToList())
                 Release(id, OwnedDevices);
         }
-    }
-
-    /// <summary>Removes every entry CouchControl owns. Call on exit.</summary>
-    public static void ReleaseAll()
-    {
-        lock (Sync) ReleaseAllLocked();
     }
 
     private static void ReleaseAllLocked()
@@ -218,17 +233,32 @@ internal static class HidHideManager
         SaveOwned();
     }
 
-    private static void RemoveStaleEntries()
+    /// <summary>
+    /// Reads the entries a previous run hid. With <paramref name="keep"/> (Manage HidHide on)
+    /// they're adopted again and stay hidden; otherwise they're un-hidden. Entries that now
+    /// belong to a ViGEm virtual pad (instance IDs can be reused) and X-Mute's old feed
+    /// entry are always removed.
+    /// </summary>
+    private static void LoadOwnedEntries(bool keep)
     {
+        var owned = new List<string>();
         var stale = new List<string>();
         try
         {
             if (File.Exists(AppPaths.HidHideStateFile))
-                stale.AddRange(File.ReadAllLines(AppPaths.HidHideStateFile));
+                owned.AddRange(File.ReadAllLines(AppPaths.HidHideStateFile));
             if (File.Exists(AppPaths.LegacyHidHideFeedFile))
                 stale.AddRange(File.ReadAllLines(AppPaths.LegacyHidHideFeedFile));
         }
         catch { }
+
+        foreach (var id in owned.Select(s => s.Trim()).Where(s => s.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (keep && !IsPresentViGEmDevice(id)) OwnedDevices.Add(id);
+            else stale.Add(id);
+        }
+        if (OwnedDevices.Count > 0)
+            AppLogger.Log($"HidHide: keeping {OwnedDevices.Count} controller(s) hidden from the previous run.");
 
         stale = stale.Select(s => s.Trim()).Where(s => s.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         if (stale.Count > 0)
@@ -246,16 +276,27 @@ internal static class HidHideManager
             catch (Exception ex)
             {
                 AppLogger.Log($"HidHide: stale cleanup failed: {ex.Message}");
-                return; // keep the file so we retry next start
+                return; // keep the files so we retry next start
             }
         }
 
-        try
-        {
-            if (File.Exists(AppPaths.HidHideStateFile)) File.Delete(AppPaths.HidHideStateFile);
-            if (File.Exists(AppPaths.LegacyHidHideFeedFile)) File.Delete(AppPaths.LegacyHidHideFeedFile);
-        }
+        // Rewrite (never just delete) the state file, so a crash or kill from here on still
+        // leaves a record of every entry we own.
+        SaveOwned();
+        try { if (File.Exists(AppPaths.LegacyHidHideFeedFile)) File.Delete(AppPaths.LegacyHidHideFeedFile); }
         catch { }
+    }
+
+    /// <summary>
+    /// True only if the device is present and driven by ViGEmBus (i.e. the instance ID now
+    /// belongs to a virtual pad). Unlike <see cref="IsUnderViGEmBus"/>, a device that isn't
+    /// present (a switched-off controller) counts as false.
+    /// </summary>
+    private static bool IsPresentViGEmDevice(string instanceId)
+    {
+        try { PnPDevice.GetDeviceByInstanceId(instanceId, DeviceLocationFlags.Normal); }
+        catch { return false; }
+        return IsUnderViGEmBus(instanceId);
     }
 
     private static void SaveOwned()

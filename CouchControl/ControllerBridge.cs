@@ -504,6 +504,8 @@ public sealed class ControllerBridge : IDisposable
         _source = source;
 
         if (old == InputSource.XInput) SetPhysicalRumble(_xinput, 0, 0);
+        // A run that was killed mid-rumble leaves the motors running; start from silence.
+        if (source == InputSource.XInput) SetPhysicalRumble(_xinput, 0, 0);
         ApplyState(ControllerState.Neutral); // nothing stays pressed for games
 
         lock (_desktopLock)
@@ -610,7 +612,9 @@ public sealed class ControllerBridge : IDisposable
         lock (_desktopLock) _desktop?.Reset(); // release any held keys/buttons
         SetPhysicalRumble(_xinput, 0, 0);
         _dualSense?.Dispose();
-        HidHideManager.ReleaseAll(); // controllers behave normally once CouchControl exits
+        // Physical controllers deliberately stay hidden after exit (see HidHideManager): this
+        // way nothing gets a chance to open them before CouchControl starts again. Turning off
+        // "Manage HidHide" in the tray un-hides them.
         _virtual?.Disconnect();
         _vigem?.Dispose();
         AppLogger.Log("Cleanup complete.");

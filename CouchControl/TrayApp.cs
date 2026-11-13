@@ -52,6 +52,26 @@ public sealed class TrayApp : IDisposable
 
         _trayIcon.DoubleClick += (_, _) => ShowStatus();
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        HidHideManager.ConnectedControllersHidden += OnConnectedControllersHidden;
+    }
+
+    private volatile bool _startupDone;
+    private bool _hiddenDuringStartup;
+
+    /// <summary>
+    /// A controller that was visible while connected may already be open in Windows apps,
+    /// which HidHide can't undo; reconnecting it once fixes that.
+    /// </summary>
+    private void OnConnectedControllersHidden(IReadOnlyList<string> kinds)
+    {
+        if (!_startupDone)
+        {
+            _hiddenDuringStartup = true; // folded into the startup notification
+            return;
+        }
+        _ui.Post(_ => _trayIcon.ShowBalloonTip(6000, "CouchControl",
+            $"Turn your {string.Join(" and ", kinds)} off and on once, so only CouchControl can read it.",
+            ToolTipIcon.Info), null);
     }
 
     private readonly SynchronizationContext _ui;
@@ -152,11 +172,14 @@ public sealed class TrayApp : IDisposable
 
         MergeConvertedBlockList();
 
-        if (_bridge.VirtualSlot != 0)
+        // One notification for both startup-order problems; turning the controller off and
+        // on fixes both (games see CouchControl as player 1, and Windows apps lose direct access).
+        if (_bridge.VirtualSlot != 0 || _hiddenDuringStartup)
             _trayIcon.ShowBalloonTip(6000, "CouchControl",
-                "Your controller was on before CouchControl started, so games may not see CouchControl as player 1. " +
-                "Turn the controller off and on again to fix this.",
+                "Your controller was already on when CouchControl started. " +
+                "Turn it off and on once so CouchControl is player 1 and is the only app reading it.",
                 ToolTipIcon.Info);
+        _startupDone = true;
         _bridge.SlotChanged += () => _ui.Post(_ =>
         {
             if (_bridge.VirtualSlot == 0)
