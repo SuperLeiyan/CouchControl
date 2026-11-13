@@ -139,7 +139,7 @@ public sealed class ControllerBridge : IDisposable
     internal const int DeadzoneRaw = 3276;
 
     /// <summary>Which physical controller is currently driving the virtual pad.</summary>
-    private enum InputSource { None, XInput, DualSense }
+    internal enum InputSource { None, XInput, DualSense }
     private volatile InputSource _source = InputSource.None;
 
     public bool IsMuted => _isMuted;
@@ -357,32 +357,71 @@ public sealed class ControllerBridge : IDisposable
         }
     }
 
+    private long _nextXInputScan;
+
     /// <summary>
-    /// Reads the active controller. A connected DualSense takes priority over XInput pads.
-    /// Returns raw state (no deadzone).
+    /// Reads both an XInput pad and a DualSense (if connected) and returns the raw state
+    /// (no deadzone) of the one in use. See <see cref="ChooseSource"/>.
     /// </summary>
     private bool TryReadInput(out ControllerState raw, out InputSource source)
     {
-        var ds = _dualSense;
-        if (ds != null && ds.TryGetState(out raw))
+        // Scanning empty XInput slots is slow, so look for a new pad at most once a second.
+        if ((_xinput == null || !_xinput.IsConnected) && Environment.TickCount64 >= _nextXInputScan)
         {
-            source = InputSource.DualSense;
-            return true;
+            _xinput = FindPhysicalController();
+            _nextXInputScan = Environment.TickCount64 + 1000;
         }
 
-        if (_xinput == null || !_xinput.IsConnected)
-            _xinput = FindPhysicalController();
-        if (_xinput != null)
+        ControllerState xiRaw = default, dsRaw = default;
+        bool xiOk = false;
+        if (_xinput != null && _xinput.IsConnected)
         {
             _xinput.GetState(out var state);
-            raw = FromGamepad(state.Gamepad);
-            source = InputSource.XInput;
-            return true;
+            xiRaw = FromGamepad(state.Gamepad);
+            xiOk = true;
         }
+        bool dsOk = _dualSense?.TryGetState(out dsRaw) == true;
 
-        raw = default;
-        source = InputSource.None;
-        return false;
+        source = ChooseSource(_source, xiOk, xiOk && HasActivity(xiRaw), dsOk, dsOk && HasActivity(dsRaw));
+        raw = source switch
+        {
+            InputSource.XInput => xiRaw,
+            InputSource.DualSense => dsRaw,
+            _ => default,
+        };
+        return source != InputSource.None;
+    }
+
+    /// <summary>
+    /// Picks the controller to use when an Xbox pad and a DualSense may both be connected:
+    /// keep the current one until the other is used while the current one is idle, so an
+    /// idle controller (e.g. one left charging) never takes over.
+    /// </summary>
+    internal static InputSource ChooseSource(InputSource current,
+        bool xiOk, bool xiActive, bool dsOk, bool dsActive)
+    {
+        if (current == InputSource.XInput && xiOk)
+            return dsActive && !xiActive ? InputSource.DualSense : InputSource.XInput;
+        if (current == InputSource.DualSense && dsOk)
+            return xiActive && !dsActive ? InputSource.XInput : InputSource.DualSense;
+
+        // No current controller (or it disconnected): prefer one being used, then Xbox.
+        if (dsActive && !xiActive) return InputSource.DualSense;
+        if (xiOk) return InputSource.XInput;
+        return dsOk ? InputSource.DualSense : InputSource.None;
+    }
+
+    /// <summary>True if any button, the Guide button, a trigger, or a stick (past the deadzone) is in use.</summary>
+    internal static bool HasActivity(ControllerState raw)
+    {
+        const byte TriggerThreshold = 30;
+        var s = ForGames(raw) with
+        {
+            Guide = raw.Guide,
+            LeftTrigger = raw.LeftTrigger > TriggerThreshold ? (byte)1 : (byte)0,
+            RightTrigger = raw.RightTrigger > TriggerThreshold ? (byte)1 : (byte)0,
+        };
+        return s != ControllerState.Neutral;
     }
 
     /// <summary>Handles a controller connecting, disconnecting, or switching.</summary>
