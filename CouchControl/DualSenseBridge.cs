@@ -140,14 +140,11 @@ public sealed class DualSenseBridge : IDisposable
             {
                 if (!Volatile.Read(ref fullReports) ||
                     Environment.TickCount64 - Interlocked.Read(ref lastReport) <= BluetoothSilenceTimeoutMs)
-                {
-                    refreshesWithoutData = 0;
                     return;
-                }
 
-                if (rumble != null && refreshesWithoutData < 3 && rumble.Refresh())
+                if (rumble != null && Volatile.Read(ref refreshesWithoutData) < 3 && rumble.Refresh())
                 {
-                    refreshesWithoutData++;
+                    Interlocked.Increment(ref refreshesWithoutData); // reset only by a real report
                     Interlocked.Exchange(ref lastReport, Environment.TickCount64); // give it another window
                     AppLogger.Log("DualSense went quiet; re-requested full reports.");
                     return;
@@ -177,6 +174,7 @@ public sealed class DualSenseBridge : IDisposable
                     break;
                 }
                 Interlocked.Exchange(ref lastReport, Environment.TickCount64);
+                Volatile.Write(ref refreshesWithoutData, 0);
                 if (bluetooth && read > 0)
                 {
                     if (buffer[0] == 0x31)
