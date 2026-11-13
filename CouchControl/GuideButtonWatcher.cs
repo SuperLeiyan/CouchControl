@@ -20,14 +20,19 @@ public sealed class GuideButtonWatcher : IDisposable
 
     private readonly Func<bool> _isEnabled;
     private readonly Func<bool> _isDualSenseGuideDown;
+    private readonly Func<int> _activeXInputSlot;
     private Thread? _thread;
     private volatile bool _running;
     private bool _loggedGuideTrayConflict;
 
-    public GuideButtonWatcher(Func<bool> isEnabled, Func<bool> isDualSenseGuideDown)
+    /// <summary>Only the controller in control can toggle the keyboard.</summary>
+    /// <param name="isDualSenseGuideDown">PS button held on the DualSense in control.</param>
+    /// <param name="activeXInputSlot">Slot of the Xbox controller in control, or -1.</param>
+    public GuideButtonWatcher(Func<bool> isEnabled, Func<bool> isDualSenseGuideDown, Func<int> activeXInputSlot)
     {
         _isEnabled = isEnabled;
         _isDualSenseGuideDown = isDualSenseGuideDown;
+        _activeXInputSlot = activeXInputSlot;
     }
 
     public void Start()
@@ -47,7 +52,7 @@ public sealed class GuideButtonWatcher : IDisposable
         {
             try
             {
-                bool guideDown = _isEnabled() && (_isDualSenseGuideDown() || IsGuideDownOnAnySlot());
+                bool guideDown = _isEnabled() && (_isDualSenseGuideDown() || IsGuideDown(_activeXInputSlot()));
                 var now = DateTime.UtcNow;
 
                 if (guideDown && !wasPressed)
@@ -86,15 +91,10 @@ public sealed class GuideButtonWatcher : IDisposable
         action();
     }
 
-    private static bool IsGuideDownOnAnySlot()
-    {
-        for (uint i = 0; i < 4; i++)
-        {
-            if (XInputGetStateEx(i, out var state) == 0 && (state.Gamepad.wButtons & GuideButton) != 0)
-                return true;
-        }
-        return false;
-    }
+    private static bool IsGuideDown(int slot)
+        => slot is >= 0 and < 4
+           && XInputGetStateEx((uint)slot, out var state) == 0
+           && (state.Gamepad.wButtons & GuideButton) != 0;
 
     // ── Show desktop ──────────────────────────────────────────────────────
 

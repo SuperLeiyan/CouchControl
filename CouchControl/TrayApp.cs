@@ -38,7 +38,8 @@ public sealed class TrayApp : IDisposable
         };
         _bridge.DesktopModeChanged += OnDesktopModeChanged;
         _guideActionsEnabled = _config.GuideButtonActions;
-        _guideWatcher = new GuideButtonWatcher(() => _guideActionsEnabled, () => _bridge.DualSenseGuideDown);
+        _guideWatcher = new GuideButtonWatcher(() => _guideActionsEnabled,
+            () => _bridge.DualSenseGuideDown, () => _bridge.ActiveXInputSlot);
         _touchpadGesturesEnabled = _config.TouchpadGestures;
         _bridge.TouchpadGestureDetected += OnTouchpadGesture;
 

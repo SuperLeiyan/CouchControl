@@ -148,8 +148,11 @@ public sealed class ControllerBridge : IDisposable
     public int PhysicalSlot => _source == InputSource.XInput && _xinput != null ? (int)_xinput.UserIndex : -1;
     public bool DualSenseConnected => _dualSense?.IsConnected == true;
     public bool DualSenseBluetooth => _dualSense?.IsBluetooth == true;
-    /// <summary>True while a connected DualSense's PS button is held.</summary>
-    public bool DualSenseGuideDown => _dualSense?.GuideDown == true;
+    /// <summary>True while the DualSense is the controller in control and its PS button is held.</summary>
+    public bool DualSenseGuideDown => _source == InputSource.DualSense && _dualSense?.GuideDown == true;
+
+    /// <summary>XInput slot of the Xbox controller in control, or -1 if it isn't an Xbox controller.</summary>
+    public int ActiveXInputSlot => _source == InputSource.XInput && _xinput is { } x ? (int)x.UserIndex : -1;
 
     /// <summary>Raised (on a worker thread) when a DualSense touchpad gesture is recognised.</summary>
     public event Action<TouchpadGesture>? TouchpadGestureDetected;
@@ -200,7 +203,11 @@ public sealed class ControllerBridge : IDisposable
 
             // DualSense reader. When a DualSense is connected, the run loop uses it in place
             // of an XInput pad and mirrors it (with muting) to games.
-            _dualSense = new DualSenseBridge(g => TouchpadGestureDetected?.Invoke(g));
+            _dualSense = new DualSenseBridge(g =>
+            {
+                // Only the controller in control can toggle the keyboard.
+                if (_source == InputSource.DualSense) TouchpadGestureDetected?.Invoke(g);
+            });
             _dualSense.Start();
             AppLogger.Log("DualSense watcher started.");
 
@@ -454,7 +461,14 @@ public sealed class ControllerBridge : IDisposable
         }
         bool dsOk = _dualSense?.TryGetState(out dsRaw) == true;
 
-        source = ChooseSource(_source, xiOk, xiOk && HasActivity(xiRaw), dsOk, dsOk && HasActivity(dsRaw));
+        // Remember when each controller became available, so the first one wins.
+        long now = Environment.TickCount64;
+        if (xiOk && !_xiWasOk) _xiSince = now;
+        if (dsOk && !_dsWasOk) _dsSince = now;
+        _xiWasOk = xiOk;
+        _dsWasOk = dsOk;
+
+        source = ChooseSource(_source, xiOk, _xiSince, dsOk, _dsSince);
         raw = source switch
         {
             InputSource.XInput => xiRaw,
@@ -464,36 +478,23 @@ public sealed class ControllerBridge : IDisposable
         return source != InputSource.None;
     }
 
+    private bool _xiWasOk, _dsWasOk;
+    private long _xiSince, _dsSince;
+
     /// <summary>
-    /// Picks the controller to use when an Xbox pad and a DualSense may both be connected:
-    /// keep the current one until the other is used while the current one is idle, so an
-    /// idle controller (e.g. one left charging) never takes over.
+    /// Picks the controller in control when an Xbox pad and a DualSense may both be
+    /// connected. The one in control keeps it until it disconnects, so two people can't
+    /// fight over it; then the other takes over. If neither is in control, the one that
+    /// connected first wins (Xbox on a tie).
     /// </summary>
     internal static InputSource ChooseSource(InputSource current,
-        bool xiOk, bool xiActive, bool dsOk, bool dsActive)
+        bool xiOk, long xiSince, bool dsOk, long dsSince)
     {
-        if (current == InputSource.XInput && xiOk)
-            return dsActive && !xiActive ? InputSource.DualSense : InputSource.XInput;
-        if (current == InputSource.DualSense && dsOk)
-            return xiActive && !dsActive ? InputSource.XInput : InputSource.DualSense;
-
-        // No current controller (or it disconnected): prefer one being used, then Xbox.
-        if (dsActive && !xiActive) return InputSource.DualSense;
+        if (current == InputSource.XInput && xiOk) return InputSource.XInput;
+        if (current == InputSource.DualSense && dsOk) return InputSource.DualSense;
+        if (xiOk && dsOk) return dsSince < xiSince ? InputSource.DualSense : InputSource.XInput;
         if (xiOk) return InputSource.XInput;
         return dsOk ? InputSource.DualSense : InputSource.None;
-    }
-
-    /// <summary>True if any button, the Guide button, a trigger, or a stick (past the deadzone) is in use.</summary>
-    internal static bool HasActivity(ControllerState raw)
-    {
-        const byte TriggerThreshold = 30;
-        var s = ForGames(raw) with
-        {
-            Guide = raw.Guide,
-            LeftTrigger = raw.LeftTrigger > TriggerThreshold ? (byte)1 : (byte)0,
-            RightTrigger = raw.RightTrigger > TriggerThreshold ? (byte)1 : (byte)0,
-        };
-        return s != ControllerState.Neutral;
     }
 
     /// <summary>Handles a controller connecting, disconnecting, or switching.</summary>
