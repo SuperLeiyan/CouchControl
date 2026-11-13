@@ -167,6 +167,68 @@ public sealed class GuideButtonWatcher : IDisposable
 /// <summary>Toggles the Windows touch keyboard via TabTip's ITipInvocation COM interface.</summary>
 internal static class TouchKeyboard
 {
+    // ── Visibility (IFrameworkInputPane reports the keyboard's on-screen rectangle) ──
+
+    [ComImport, Guid("D5120AA3-46BA-44C5-822D-CA8092C1FC72")]
+    private class FrameworkInputPane { }
+
+    [ComImport, Guid("5752238B-24F0-495A-82F1-2FD593056796")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFrameworkInputPane
+    {
+        void Advise([MarshalAs(UnmanagedType.IUnknown)] object pWindow, IntPtr pHandler, out int pdwCookie);
+        void AdviseWithHWND(IntPtr hwnd, IntPtr pHandler, out int pdwCookie);
+        void Unadvise(int dwCookie);
+        void Location(out RECT prcInputPaneScreenLocation);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int Left, Top, Right, Bottom; }
+
+    private static volatile bool _visible;
+    private static Thread? _monitor;
+
+    /// <summary>True while the touch keyboard is on screen (updated every 150 ms).</summary>
+    public static bool IsVisible => _visible;
+
+    /// <summary>Starts polling the keyboard's visibility on a background STA thread.</summary>
+    public static void StartMonitor()
+    {
+        if (_monitor != null) return;
+        _monitor = new Thread(() =>
+        {
+            IFrameworkInputPane? pane = null;
+            bool loggedError = false;
+            while (true)
+            {
+                try
+                {
+                    pane ??= (IFrameworkInputPane)new FrameworkInputPane();
+                    pane.Location(out var r);
+                    bool visible = r.Right > r.Left && r.Bottom > r.Top;
+                    if (visible != _visible)
+                    {
+                        _visible = visible;
+                        AppLogger.Log($"Touch keyboard {(visible ? "shown" : "hidden")}.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!loggedError)
+                    {
+                        loggedError = true;
+                        AppLogger.Log($"Touch keyboard visibility check failed: {ex.GetType().Name} 0x{ex.HResult:X8}");
+                    }
+                    pane = null;
+                    _visible = false;
+                }
+                Thread.Sleep(150);
+            }
+        }) { IsBackground = true, Name = "TouchKeyboardMonitor" };
+        _monitor.SetApartmentState(ApartmentState.STA);
+        _monitor.Start();
+    }
+
     [ComImport, Guid("4ce576fa-83dc-4F88-951c-9d0782b4e376")]
     private class UIHostNoLaunch { }
 
@@ -185,6 +247,19 @@ internal static class TouchKeyboard
     [DllImport("user32.dll")] private static extern bool DestroyWindow(IntPtr hWnd);
 
     public static void Toggle()
+    {
+        bool wasVisible = _visible;
+        ToggleCore();
+        // Diagnostics: report toggles that didn't change anything.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(400);
+            if (_monitor != null && _visible == wasVisible)
+                AppLogger.Log($"Touch keyboard toggle had no effect (still {(wasVisible ? "shown" : "hidden")}).");
+        });
+    }
+
+    private static void ToggleCore()
     {
         IntPtr helperHwnd = IntPtr.Zero;
         try

@@ -89,7 +89,8 @@ public sealed class DualSenseBridge : IDisposable
                 }
 
                 _reportedOpenFailures.Remove(path);
-                RunSession(path, handle);
+                if (!RunSession(path, handle))
+                    Sleep(2000); // device present but silent (e.g. a Bluetooth pad that's switched off)
             }
             catch (Exception ex)
             {
@@ -99,33 +100,54 @@ public sealed class DualSenseBridge : IDisposable
         }
     }
 
-    /// <summary>One connected-controller session: pump reports until it disconnects.</summary>
-    private void RunSession(string path, SafeFileHandle handle)
+    /// <summary>
+    /// A Bluetooth DualSense that's switched off can stay in Device Manager with reads that
+    /// never complete. Once it has sent nothing for this long, the session ends. (Full
+    /// Bluetooth reports arrive hundreds of times a second.)
+    /// </summary>
+    private const int BluetoothSilenceTimeoutMs = 2000;
+
+    /// <summary>
+    /// One controller session: pump reports until it disconnects or goes silent.
+    /// Returns false if the controller never sent a report.
+    /// </summary>
+    private bool RunSession(string path, SafeFileHandle handle)
     {
         if (!TryGetCaps(handle, out var caps) || caps.InputReportByteLength <= 0)
         {
             AppLogger.Log("DualSense: could not read HID capabilities.");
-            Sleep(2000);
-            return;
+            return false;
         }
         int reportLength = caps.InputReportByteLength;
-
         bool bluetooth = path.Contains("00001124", StringComparison.OrdinalIgnoreCase);
-        AppLogger.Log($"DualSense connected ({(bluetooth ? "Bluetooth" : "USB/virtual")}, report {reportLength} bytes).");
 
         using var rumble = RumbleWriter.TryOpen(path, bluetooth, caps.OutputReportByteLength,
             UsesVibrationV2(path, handle, caps.FeatureReportByteLength));
-        // An output report also switches a Bluetooth DualSense from its "simple" input
-        // report to the full one, which carries the touchpad data.
-        rumble?.Set(0, 0);
-        _rumble = rumble;
 
         IsBluetooth = bluetooth;
-        IsConnected = true;
         _handle = handle;
+        long lastReport = Environment.TickCount64;
+        bool fullReports = false; // set once full (continuous) Bluetooth reports arrive
+        bool silent = false;
+
+        // Bluetooth watchdog: cancel the blocking read if a controller that was streaming
+        // full reports goes quiet. Simple reports may only arrive on change, so they don't count.
+        using var watchdog = bluetooth
+            ? new System.Threading.Timer(_ =>
+            {
+                if (Volatile.Read(ref fullReports) &&
+                    Environment.TickCount64 - Interlocked.Read(ref lastReport) > BluetoothSilenceTimeoutMs)
+                {
+                    Volatile.Write(ref silent, true);
+                    CancelIoEx(handle, IntPtr.Zero);
+                }
+            }, null, 500, 500)
+            : null;
+
         var buffer = new byte[reportLength];
         var gestures = new TouchpadGestureDetector();
         bool loggedTouch = false;
+        bool gotReport = false;
         try
         {
             while (_running)
@@ -133,9 +155,25 @@ public sealed class DualSenseBridge : IDisposable
                 if (!ReadFile(handle, buffer, (uint)buffer.Length, out uint read, IntPtr.Zero))
                 {
                     int err = Marshal.GetLastWin32Error();
-                    if (_running)
-                        AppLogger.Log($"DualSense disconnected ({new Win32Exception(err).Message}).");
+                    if (_running && gotReport)
+                        AppLogger.Log(Volatile.Read(ref silent)
+                            ? "DualSense disconnected (no data for 2 seconds)."
+                            : $"DualSense disconnected ({new Win32Exception(err).Message}).");
                     break;
+                }
+                Interlocked.Exchange(ref lastReport, Environment.TickCount64);
+                if (bluetooth && read > 0 && buffer[0] == 0x31) Volatile.Write(ref fullReports, true);
+
+                if (!gotReport)
+                {
+                    // Only now do we know the controller is really on.
+                    gotReport = true;
+                    AppLogger.Log($"DualSense connected ({(bluetooth ? "Bluetooth" : "USB/virtual")}, report {reportLength} bytes).");
+                    // An output report also switches a Bluetooth DualSense from its "simple"
+                    // input report to the full one, which carries the touchpad data.
+                    rumble?.Set(0, 0);
+                    _rumble = rumble;
+                    IsConnected = true;
                 }
 
                 var report = buffer.AsSpan(0, (int)read);
@@ -179,8 +217,8 @@ public sealed class DualSenseBridge : IDisposable
             }
             _guideDown = false;
             IsConnected = false;
-            AppLogger.Log("DualSense session ended.");
         }
+        return gotReport;
     }
 
     private static string? FindDualSensePath()

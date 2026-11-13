@@ -140,6 +140,7 @@ public sealed class ControllerBridge : IDisposable
 
     /// <summary>Which physical controller is currently driving the virtual pad.</summary>
     internal enum InputSource { None, XInput, DualSense }
+    private bool _keyboardNav; // poll thread only
     private volatile InputSource _source = InputSource.None;
 
     public bool IsMuted => _isMuted;
@@ -250,6 +251,8 @@ public sealed class ControllerBridge : IDisposable
             _dualSense.Start();
             AppLogger.Log("DualSense watcher started.");
 
+            TouchKeyboard.StartMonitor();
+
             // Catch controllers that connect later (e.g. when a stream starts).
             _hidHideTimer = new System.Threading.Timer(_ =>
             {
@@ -349,9 +352,26 @@ public sealed class ControllerBridge : IDisposable
 
                 double dt = Math.Clamp(pollClock.Elapsed.TotalSeconds, 0, 0.05);
                 pollClock.Restart();
-                lock (_desktopLock) _desktop?.Update(ToPadState(raw), dt);
 
-                ApplyState(_isMuted ? ControllerState.Neutral : ForGames(raw));
+                // Windows' touch keyboard reads Xbox controllers itself, but it only sees a
+                // DualSense through the virtual pad. While it's open, a DualSense drives the
+                // keyboard: the virtual pad stays live and desktop mode pauses.
+                bool keyboardNav = source == InputSource.DualSense && TouchKeyboard.IsVisible;
+                if (keyboardNav != _keyboardNav)
+                {
+                    _keyboardNav = keyboardNav;
+                    AppLogger.Log(keyboardNav
+                        ? "Touch keyboard open: DualSense now drives the keyboard."
+                        : "Touch keyboard closed: DualSense back to normal.");
+                }
+
+                lock (_desktopLock)
+                {
+                    if (keyboardNav) _desktop?.Suspend(ToPadState(raw));
+                    else _desktop?.Update(ToPadState(raw), dt);
+                }
+
+                ApplyState(_isMuted && !keyboardNav ? ControllerState.Neutral : ForGames(raw));
             }
             catch (SharpDX.SharpDXException ex) when (ex.ResultCode.Code == unchecked((int)0x8007001E))
             {
