@@ -172,6 +172,7 @@ public sealed class ControllerBridge : IDisposable
             var freed = SlotZeroClaimer.FreeSlotZero();
             try
             {
+                var before = ConnectedSlots();
                 _vigem = new ViGEmClient();
                 _virtual = _vigem.CreateXbox360Controller();
                 _submitReport = _virtual.GetType().GetMethod("SubmitReport",
@@ -180,48 +181,38 @@ public sealed class ControllerBridge : IDisposable
                     AppLogger.Log("WARNING: SubmitReport not found.");
                 _virtual.FeedbackReceived += OnGameRumble;
                 _virtual.Connect();
-                Thread.Sleep(300);
+
+                // The virtual controller is whichever slot appears after connecting it.
+                for (int i = 0; i < 20 && _virtualSlot == -1; i++)
+                {
+                    Thread.Sleep(100);
+                    var added = ConnectedSlots().Except(before).ToList();
+                    if (added.Count > 0) _virtualSlot = added.Min();
+                }
             }
             finally
             {
-                // The re-enabled pad reconnects into a later slot; the run loop picks it up.
+                // The physical pad comes back into a later slot; the run loop picks it up.
                 SlotZeroClaimer.Restore(freed);
             }
 
-            // Identify virtual vs physical slots.
-            // ViGEm virtual controllers have no XInput instance ID; physical controllers do.
-            var allSlots = new List<(int slot, Controller ctrl)>();
-            for (int i = 0; i < 4; i++)
+            if (_virtualSlot == -1)
             {
-                var c = new Controller((UserIndex)i);
-                if (c.IsConnected) allSlots.Add((i, c));
+                // Fallback: ViGEm virtual controllers have no XInput instance ID; physical ones do.
+                _virtualSlot = ConnectedSlots().FirstOrDefault(s => FindXInputInstanceId(s) == null, -1);
+                AppLogger.Log(_virtualSlot >= 0
+                    ? $"Virtual controller on slot {_virtualSlot} (found by instance ID)."
+                    : "WARNING: could not tell which slot the virtual controller is on.");
+            }
+            else
+            {
+                AppLogger.Log($"Virtual controller on slot {_virtualSlot}.");
             }
 
-            var physicalControllers = new List<Controller>();
-            foreach (var (slot, ctrl) in allSlots)
-            {
-                var id = FindXInputInstanceId(slot);
-                if (id == null)
-                {
-                    _virtualSlot = slot;
-                    AppLogger.Log($"Virtual controller on slot {slot}.");
-                }
-                else
-                {
-                    physicalControllers.Add(ctrl);
-                    AppLogger.Log($"Physical controller on slot {slot}.");
-                }
-            }
-
-            if (_virtualSlot == -1 && allSlots.Count >= 1)
-            {
-                _virtualSlot = allSlots[0].slot;
-                AppLogger.Log($"Virtual controller on slot {_virtualSlot} (fallback).");
-            }
-
-            _xinput = physicalControllers.Count > 0 ? physicalControllers[0] : FindPhysicalController();
-            if (_xinput == null)
-                AppLogger.Log("No physical controller found. Will retry during run loop.");
+            _xinput = FindPhysicalController();
+            AppLogger.Log(_xinput != null
+                ? $"Physical controller on slot {(int)_xinput.UserIndex}."
+                : "No physical controller found. Will retry during run loop.");
 
             if (_virtualSlot == 0)
                 AppLogger.Log("Virtual controller on slot 0 — all games will see it correctly.");
@@ -308,6 +299,14 @@ public sealed class ControllerBridge : IDisposable
             });
         }
         catch { } // disconnected mid-call; the run loop handles reconnects
+    }
+
+    private static List<int> ConnectedSlots()
+    {
+        var slots = new List<int>();
+        for (int i = 0; i < 4; i++)
+            if (new Controller((UserIndex)i).IsConnected) slots.Add(i);
+        return slots;
     }
 
     private Controller? FindPhysicalController()
