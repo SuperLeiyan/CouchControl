@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="CouchControl.Tests/CouchControl.Tests.csproj" />
+  <Project Path="CouchControl/CouchControl.csproj" />
+</Solution>

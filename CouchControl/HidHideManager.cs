@@ -1,0 +1,403 @@
+using System.Diagnostics;
+using System.Text.RegularExpressions;
+using Nefarius.Drivers.HidHide;
+using Nefarius.Utilities.DeviceManagement.PnP;
+
+namespace CouchControl;
+
+/// <summary>
+/// Everything CouchControl does with HidHide:
+///
+///  • Allow list — adds CouchControl and JoyXoff so they can see hidden controllers.
+///    Existing entries are never removed.
+///  • Feed — hides CouchControl's own DualSense feed controller from games.
+///  • Physical controllers (when "Manage HidHide" is on) — hides real Xbox/XInput pads
+///    and DualSense controllers so games only see CouchControl's virtual controller.
+///
+/// Only instance IDs CouchControl added itself are tracked as "owned". Owned entries are
+/// removed when CouchControl exits (so controllers behave normally without it) and on the
+/// next start after a crash. Devices the user hid manually are left alone.
+/// </summary>
+internal static class HidHideManager
+{
+    // XInput-capable devices have "IG_" in their interface path; ViGEm virtual pads don't.
+    private static readonly Regex XInputPath = new(@"[&#_]IG_[0-9A-F]{2}", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DualSensePath = new(@"054c[_&]pid[_&](0ce6|0df2)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly object Sync = new();
+    private static readonly HashSet<string> OwnedFeed = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> OwnedDevices = new(StringComparer.OrdinalIgnoreCase);
+    private static bool _usable;
+
+    public static bool IsUsable => _usable;
+
+    /// <summary>
+    /// Call once at startup before creating any ViGEm devices: clears stale owned entries
+    /// and, when <paramref name="manage"/> is set, makes sure the allow list is correct.
+    /// </summary>
+    public static void Initialize(bool manage)
+    {
+        lock (Sync)
+        {
+            RemoveStaleEntries();
+
+            try
+            {
+                var svc = new HidHideControlService();
+                if (!svc.IsInstalled)
+                {
+                    AppLogger.Log("HidHide: not installed. Games will see all controllers directly.");
+                    return;
+                }
+                if (svc.IsAppListInverted)
+                {
+                    if (!manage || File.Exists(AppPaths.HidHideBackupFile))
+                    {
+                        // Either automation is off, or we converted before and the user
+                        // deliberately switched back. Respect that.
+                        AppLogger.Log("HidHide: application list is inverted (block-list mode); CouchControl won't manage HidHide.");
+                        return;
+                    }
+                    ConvertFromInverted(svc);
+                }
+
+                if (manage)
+                {
+                    EnsureAllowed(svc, Environment.ProcessPath);
+
+                    if (!svc.IsActive)
+                    {
+                        svc.IsActive = true;
+                        AppLogger.Log("HidHide: device hiding was disabled; enabled it.");
+                    }
+                }
+
+                _usable = IsSelfAllowed(svc);
+                if (!_usable)
+                    AppLogger.Log("HidHide: CouchControl is not on the application list, so it won't hide anything. " +
+                        "Turn on 'Manage HidHide' or add CouchControl.exe in HidHide Configuration Client.");
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Log($"HidHide: initialization failed: {ex.Message}");
+            }
+        }
+    }
+
+    // ── Feed controller ───────────────────────────────────────────────────
+
+    public static bool TryHideFeed(string instanceId)
+    {
+        lock (Sync)
+        {
+            if (!TryBlock(instanceId, OwnedFeed)) return false;
+            AppLogger.Log($"HidHide: hid DualSense feed {instanceId} from games.");
+            return true;
+        }
+    }
+
+    public static void UnhideFeed(string instanceId)
+    {
+        lock (Sync) Release(instanceId, OwnedFeed);
+    }
+
+    // ── Physical controllers ──────────────────────────────────────────────
+
+    /// <summary>Hides any present physical XInput pad or DualSense not already hidden.</summary>
+    public static void HidePhysicalControllers()
+    {
+        lock (Sync)
+        {
+            if (!_usable) return;
+            try
+            {
+                var svc = new HidHideControlService();
+                var blocked = new HashSet<string>(svc.BlockedInstanceIds, StringComparer.OrdinalIgnoreCase);
+                foreach (var (id, kind) in FindPhysicalControllers())
+                {
+                    if (blocked.Contains(id) || OwnedFeed.Contains(id)) continue;
+                    svc.AddBlockedInstanceId(id);
+                    OwnedDevices.Add(id);
+                    SaveOwned();
+                    AppLogger.Log($"HidHide: hid {kind} {id} from games.");
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Log($"HidHide: hiding physical controllers failed: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>Un-hides the physical controllers CouchControl hid (not the user's own entries).</summary>
+    public static void ReleasePhysicalControllers()
+    {
+        lock (Sync)
+        {
+            foreach (var id in OwnedDevices.ToList())
+                Release(id, OwnedDevices);
+        }
+    }
+
+    /// <summary>Removes every entry CouchControl owns. Call on exit.</summary>
+    public static void ReleaseAll()
+    {
+        lock (Sync) ReleaseAllLocked();
+    }
+
+    private static void ReleaseAllLocked()
+    {
+        foreach (var id in OwnedDevices.ToList()) Release(id, OwnedDevices);
+        foreach (var id in OwnedFeed.ToList()) Release(id, OwnedFeed);
+    }
+
+    /// <summary>
+    /// Physical controllers to hide from games:
+    ///   • every XInput (XUSB) device — hides it from XInput games
+    ///   • XInput-compatible HID devices ("IG_" in the path) — the DirectInput/HID view
+    ///     of the same pads
+    ///   • DualSense HID devices (USB, Bluetooth, or USB/IP from a stream host)
+    /// Anything under ViGEmBus is skipped: that's CouchControl's own virtual controllers
+    /// (and their DirectInput children) or another app's, and games must keep seeing them.
+    /// </summary>
+    internal static IEnumerable<(string id, string kind)> FindPhysicalControllers()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var results = new List<(string, string)>();
+
+        foreach (var (_, id) in Enumerate(DeviceInterfaceIds.XUsbDevice))
+            if (seen.Add(id) && !IsUnderViGEmBus(id))
+                results.Add((id, "Xbox controller"));
+
+        foreach (var (path, id) in Enumerate(DeviceInterfaceIds.HidDevice))
+        {
+            string? kind = DualSensePath.IsMatch(path) ? "DualSense"
+                : XInputPath.IsMatch(path) ? "Xbox controller (HID)"
+                : null;
+            if (kind != null && seen.Add(id) && !IsUnderViGEmBus(id))
+                results.Add((id, kind));
+        }
+        return results;
+    }
+
+    /// <summary>True if the device or any ancestor is driven by the ViGEmBus service.</summary>
+    internal static bool IsUnderViGEmBus(string instanceId)
+    {
+        try
+        {
+            IPnPDevice? device = PnPDevice.GetDeviceByInstanceId(instanceId, DeviceLocationFlags.Normal);
+            for (int depth = 0; device != null && depth < 8; depth++)
+            {
+                var service = device.GetProperty<string>(DevicePropertyKey.Device_Service);
+                if (string.Equals(service, "ViGEmBus", StringComparison.OrdinalIgnoreCase))
+                    return true;
+                device = device.Parent;
+            }
+            return false;
+        }
+        catch
+        {
+            return true; // can't tell — err on the side of not hiding
+        }
+    }
+
+    // ── Internals ─────────────────────────────────────────────────────────
+
+    private static bool TryBlock(string instanceId, HashSet<string> owner)
+    {
+        if (!_usable)
+        {
+            AppLogger.Log($"HidHide: not usable; {instanceId} stays visible to games.");
+            return false;
+        }
+        try
+        {
+            var svc = new HidHideControlService();
+            if (svc.BlockedInstanceIds.Contains(instanceId, StringComparer.OrdinalIgnoreCase))
+                return true; // already hidden (by the user); don't take ownership
+            svc.AddBlockedInstanceId(instanceId);
+            owner.Add(instanceId);
+            SaveOwned();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"HidHide: block {instanceId} failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static void Release(string instanceId, HashSet<string> owner)
+    {
+        if (!owner.Remove(instanceId)) return;
+        try
+        {
+            var svc = new HidHideControlService();
+            if (svc.IsInstalled) svc.RemoveBlockedInstanceId(instanceId);
+            AppLogger.Log($"HidHide: un-hid {instanceId}.");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"HidHide: unblock {instanceId} failed: {ex.Message}");
+        }
+        SaveOwned();
+    }
+
+    private static void RemoveStaleEntries()
+    {
+        var stale = new List<string>();
+        try
+        {
+            if (File.Exists(AppPaths.HidHideStateFile))
+                stale.AddRange(File.ReadAllLines(AppPaths.HidHideStateFile));
+            if (File.Exists(AppPaths.LegacyHidHideFeedFile))
+                stale.AddRange(File.ReadAllLines(AppPaths.LegacyHidHideFeedFile));
+        }
+        catch { }
+
+        stale = stale.Select(s => s.Trim()).Where(s => s.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (stale.Count > 0)
+        {
+            try
+            {
+                var svc = new HidHideControlService();
+                if (svc.IsInstalled)
+                    foreach (var id in stale)
+                    {
+                        svc.RemoveBlockedInstanceId(id);
+                        AppLogger.Log($"HidHide: removed stale entry {id}.");
+                    }
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Log($"HidHide: stale cleanup failed: {ex.Message}");
+                return; // keep the file so we retry next start
+            }
+        }
+
+        try
+        {
+            if (File.Exists(AppPaths.HidHideStateFile)) File.Delete(AppPaths.HidHideStateFile);
+            if (File.Exists(AppPaths.LegacyHidHideFeedFile)) File.Delete(AppPaths.LegacyHidHideFeedFile);
+        }
+        catch { }
+    }
+
+    private static void SaveOwned()
+    {
+        try
+        {
+            Directory.CreateDirectory(AppPaths.DataDir);
+            File.WriteAllLines(AppPaths.HidHideStateFile, OwnedFeed.Concat(OwnedDevices));
+        }
+        catch { }
+    }
+
+    private static void EnsureAllowed(HidHideControlService svc, string? path)
+    {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+        if (svc.ApplicationPaths.Any(p => PathEquals(p, path))) return;
+        svc.AddApplicationPath(path, false);
+        AppLogger.Log($"HidHide: added {path} to the application list.");
+    }
+
+    private static bool IsSelfAllowed(HidHideControlService svc)
+    {
+        var self = Environment.ProcessPath ?? "";
+        return svc.ApplicationPaths.Any(p => PathEquals(p, self));
+    }
+
+    // ── Inverted (block-list) mode conversion ─────────────────────────────
+
+    private sealed record HidHideBackup(DateTime SavedAt, bool AppListInverted, bool Active, List<string> ApplicationPaths);
+
+    /// <summary>
+    /// Process names that were on HidHide's block list before CouchControl switched it to
+    /// normal mode. The tray app merges these into Auto-Mute Processes.
+    /// </summary>
+    public static IReadOnlyList<string> ConvertedBlockListProcesses { get; private set; } = [];
+
+    public static bool HasBackup => File.Exists(AppPaths.HidHideBackupFile);
+
+    /// <summary>
+    /// Backs up the current settings, then switches HidHide from block-list mode to normal
+    /// (allow-list) mode with an empty list. CouchControl adds itself right after.
+    /// </summary>
+    private static void ConvertFromInverted(HidHideControlService svc)
+    {
+        var paths = svc.ApplicationPaths.ToList();
+        var backup = new HidHideBackup(DateTime.Now, true, svc.IsActive, paths);
+        Directory.CreateDirectory(AppPaths.DataDir);
+        File.WriteAllText(AppPaths.HidHideBackupFile,
+            System.Text.Json.JsonSerializer.Serialize(backup, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+
+        svc.ClearApplicationsList();
+        svc.IsAppListInverted = false;
+
+        var skip = new[] { "CouchControl", "X-Mute", "Joyxoff", "JoyxSvc" };
+        ConvertedBlockListProcesses = paths
+            .Select(Path.GetFileNameWithoutExtension)
+            .OfType<string>()
+            .Where(n => n.Length > 0 && !skip.Contains(n, StringComparer.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        AppLogger.Log($"HidHide: switched from block-list mode to normal mode. Backup saved to {AppPaths.HidHideBackupFile}. " +
+            $"Former block list ({paths.Count}): {string.Join(", ", paths)}");
+    }
+
+    /// <summary>
+    /// Restores the HidHide settings saved before the conversion and deletes the backup.
+    /// Returns false if there's no backup or the restore failed.
+    /// </summary>
+    public static bool RestoreBackup()
+    {
+        lock (Sync)
+        {
+            try
+            {
+                if (!File.Exists(AppPaths.HidHideBackupFile)) return false;
+                var backup = System.Text.Json.JsonSerializer.Deserialize<HidHideBackup>(
+                    File.ReadAllText(AppPaths.HidHideBackupFile));
+                if (backup == null) return false;
+
+                ReleaseAllLocked();
+                var svc = new HidHideControlService();
+                svc.ClearApplicationsList();
+                foreach (var p in backup.ApplicationPaths)
+                    svc.AddApplicationPath(p, false);
+                svc.IsAppListInverted = backup.AppListInverted;
+                svc.IsActive = backup.Active;
+                _usable = false;
+
+                File.Delete(AppPaths.HidHideBackupFile);
+                AppLogger.Log($"HidHide: restored settings from {backup.SavedAt:g} ({backup.ApplicationPaths.Count} apps, inverted={backup.AppListInverted}).");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Log($"HidHide: restore failed: {ex.Message}");
+                return false;
+            }
+        }
+    }
+
+    private static IEnumerable<(string path, string instanceId)> Enumerate(Guid interfaceGuid)
+    {
+        var results = new List<(string, string)>();
+        try
+        {
+            int index = 0;
+            while (Devcon.FindByInterfaceGuid(interfaceGuid, out string path, out string id, index++, true))
+                results.Add((path, id));
+        }
+        catch { }
+        return results;
+    }
+
+    private static bool PathEquals(string a, string b)
+    {
+        try { return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
+        catch { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+    }
+}
