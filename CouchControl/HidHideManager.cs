@@ -105,10 +105,25 @@ internal static class HidHideManager
             }
             catch (Exception ex)
             {
-                AppLogger.Log($"HidHide: hiding physical controllers failed: {ex.Message}");
+                // This runs every 2 s. HidHide's driver allows one client at a time, so it fails
+                // while e.g. the HidHide Configuration Client is open; log once until it recovers.
+                if (!_hideFailureLogged)
+                {
+                    _hideFailureLogged = true;
+                    AppLogger.Log($"HidHide: hiding physical controllers failed: {ex.Message.Split('\n')[0].Trim()} " +
+                        "(Is the HidHide Configuration Client open? Close it so CouchControl can manage HidHide.) Retrying quietly.");
+                }
+                return;
+            }
+            if (_hideFailureLogged)
+            {
+                _hideFailureLogged = false;
+                AppLogger.Log("HidHide: access restored.");
             }
         }
     }
+
+    private static bool _hideFailureLogged;
 
     /// <summary>Un-hides the physical controllers CouchControl hid (not the user's own entries).</summary>
     public static void ReleasePhysicalControllers()
@@ -186,16 +201,19 @@ internal static class HidHideManager
 
     private static void Release(string instanceId, HashSet<string> owner)
     {
-        if (!owner.Remove(instanceId)) return;
+        if (!owner.Contains(instanceId)) return;
         try
         {
             var svc = new HidHideControlService();
             if (svc.IsInstalled) svc.RemoveBlockedInstanceId(instanceId);
+            owner.Remove(instanceId);
             AppLogger.Log($"HidHide: un-hid {instanceId}.");
         }
         catch (Exception ex)
         {
-            AppLogger.Log($"HidHide: unblock {instanceId} failed: {ex.Message}");
+            // Keep ownership: the entry stays in the state file, so the next start's
+            // stale-entry cleanup un-hides it.
+            AppLogger.Log($"HidHide: unblock {instanceId} failed: {ex.Message.Split('\n')[0].Trim()} Will retry on next start.");
         }
         SaveOwned();
     }
