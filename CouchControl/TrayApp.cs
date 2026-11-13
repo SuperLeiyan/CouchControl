@@ -38,7 +38,7 @@ public sealed class TrayApp : IDisposable
         };
         _bridge.DesktopModeChanged += OnDesktopModeChanged;
         _guideActionsEnabled = _config.GuideButtonActions;
-        _guideWatcher = new GuideButtonWatcher(() => _guideActionsEnabled);
+        _guideWatcher = new GuideButtonWatcher(() => _guideActionsEnabled, () => _bridge.DualSenseGuideDown);
         _touchpadGesturesEnabled = _config.TouchpadGestures;
         _bridge.TouchpadGestureDetected += OnTouchpadGesture;
 
@@ -184,7 +184,7 @@ public sealed class TrayApp : IDisposable
         _slotInfoItem = new ToolStripMenuItem("Virtual: slot ? | Physical: slot ?") { Enabled = false };
         menu.Items.Add(_slotInfoItem);
 
-        // DualSense feed info (non-clickable)
+        // DualSense info (non-clickable)
         _dualSenseItem = new ToolStripMenuItem("DualSense: not detected") { Enabled = false };
         menu.Items.Add(_dualSenseItem);
 
@@ -300,7 +300,8 @@ public sealed class TrayApp : IDisposable
             int vs = _bridge.VirtualSlot;
             int ps = _bridge.PhysicalSlot;
             string vsText = vs >= 0 ? $"slot {vs}" : "unknown";
-            string psText = ps >= 0 ? $"slot {ps}" : "not connected";
+            string psText = _bridge.DualSenseConnected ? "DualSense"
+                : ps >= 0 ? $"slot {ps}" : "not connected";
             _slotInfoItem.Text = $"Virtual: {vsText}  |  Physical: {psText}";
             _slotInfoItem.ForeColor = vs == 0
                 ? System.Drawing.Color.DarkGreen
@@ -308,12 +309,8 @@ public sealed class TrayApp : IDisposable
 
             if (_bridge.DualSenseConnected)
             {
-                int fs = _bridge.DualSenseFeedSlot;
-                string hidden = _bridge.DualSenseFeedHidden ? "hidden from games" : "NOT hidden";
-                _dualSenseItem.Text = $"DualSense: feed on slot {(fs >= 0 ? fs.ToString() : "?")} ({hidden})";
-                _dualSenseItem.ForeColor = _bridge.DualSenseFeedHidden
-                    ? System.Drawing.Color.DarkGreen
-                    : System.Drawing.Color.DarkOrange;
+                _dualSenseItem.Text = $"DualSense: connected ({(_bridge.DualSenseBluetooth ? "Bluetooth" : "USB")})";
+                _dualSenseItem.ForeColor = System.Drawing.Color.DarkGreen;
             }
             else
             {

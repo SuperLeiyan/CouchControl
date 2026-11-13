@@ -3,23 +3,19 @@ using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using Microsoft.Win32.SafeHandles;
 using Nefarius.Utilities.DeviceManagement.PnP;
-using Nefarius.ViGEm.Client;
-using Nefarius.ViGEm.Client.Targets;
 
 namespace CouchControl;
 
 /// <summary>
 /// Reads a Sony DualSense (USB, Bluetooth, or the virtual one exposed by a Moonlight /
-/// Sunshine stream) over raw HID and mirrors it onto a dedicated, always-live ViGEm
-/// Xbox 360 "feed" controller.
+/// Sunshine stream) over raw HID and keeps its latest state for <see cref="ControllerBridge"/>,
+/// which copies it to the main virtual Xbox 360 controller:
 ///
-///   DualSense (HID) ──► feed X360 (XInput, never muted) ──► JoyXoff
-///                                   │
-///                                   └─► ControllerBridge picks it up as a "physical"
-///                                       XInput pad ──► main virtual X360 (muted) ──► games
+///   DualSense (HID) ──► DualSenseBridge ──► ControllerBridge ──► main virtual X360 ──► games
+///         ▲                                        │
+///         └──────────── rumble ◄───────────────────┘
 ///
-/// The feed is hidden from games through HidHide (see <see cref="HidHideManager"/>) so
-/// games don't receive double input.
+/// The physical DualSense is hidden from games through HidHide (see <see cref="HidHideManager"/>).
 /// </summary>
 public sealed class DualSenseBridge : IDisposable
 {
@@ -28,21 +24,27 @@ public sealed class DualSenseBridge : IDisposable
     private static readonly Regex DualSensePath = new(
         @"054c[_&]pid[_&](0ce6|0df2)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    private readonly ViGEmClient _vigem;
     private Thread? _thread;
     private volatile bool _running;
     private volatile SafeFileHandle? _handle;
+    private volatile RumbleWriter? _rumble;
     private readonly HashSet<string> _reportedOpenFailures = new(StringComparer.OrdinalIgnoreCase);
 
+    private readonly object _stateLock = new();
+    private ControllerState _state;
+    private bool _hasState;
+    private volatile bool _guideDown;
+
     public bool IsConnected { get; private set; }
-    public int FeedSlot { get; private set; } = -1;
-    public bool FeedHidden { get; private set; }
+    public bool IsBluetooth { get; private set; }
+
+    /// <summary>True while the PS button is held.</summary>
+    public bool GuideDown => _guideDown;
 
     private readonly Action<TouchpadGesture>? _onGesture;
 
-    public DualSenseBridge(ViGEmClient vigem, Action<TouchpadGesture>? onGesture = null)
+    public DualSenseBridge(Action<TouchpadGesture>? onGesture = null)
     {
-        _vigem = vigem;
         _onGesture = onGesture;
     }
 
@@ -52,6 +54,19 @@ public sealed class DualSenseBridge : IDisposable
         _thread = new Thread(Run) { IsBackground = true, Name = "DualSenseBridge" };
         _thread.Start();
     }
+
+    /// <summary>Latest raw state (no deadzone). False if no DualSense is connected.</summary>
+    internal bool TryGetState(out ControllerState state)
+    {
+        lock (_stateLock)
+        {
+            state = _state;
+            return _hasState;
+        }
+    }
+
+    /// <summary>Sets the rumble motors (0–255). Ignored if no DualSense is connected.</summary>
+    public void SetRumble(byte largeMotor, byte smallMotor) => _rumble?.Set(largeMotor, smallMotor);
 
     private void Run()
     {
@@ -84,7 +99,7 @@ public sealed class DualSenseBridge : IDisposable
         }
     }
 
-    /// <summary>One connected-controller session: create feed, pump reports, tear down.</summary>
+    /// <summary>One connected-controller session: pump reports until it disconnects.</summary>
     private void RunSession(string path, SafeFileHandle handle)
     {
         if (!TryGetCaps(handle, out var caps) || caps.InputReportByteLength <= 0)
@@ -98,27 +113,15 @@ public sealed class DualSenseBridge : IDisposable
         bool bluetooth = path.Contains("00001124", StringComparison.OrdinalIgnoreCase);
         AppLogger.Log($"DualSense connected ({(bluetooth ? "Bluetooth" : "USB/virtual")}, report {reportLength} bytes).");
 
-        // Rumble: games rumble the main virtual pad, ControllerBridge forwards that to the
-        // feed pad via XInput, and the feed's feedback is written to the DualSense here.
         using var rumble = RumbleWriter.TryOpen(path, bluetooth, caps.OutputReportByteLength,
             UsesVibrationV2(path, handle, caps.FeatureReportByteLength));
+        // An output report also switches a Bluetooth DualSense from its "simple" input
+        // report to the full one, which carries the touchpad data.
+        rumble?.Set(0, 0);
+        _rumble = rumble;
 
-        var before = GetXUsbInstanceIds();
-        var feed = _vigem.CreateXbox360Controller();
-        feed.AutoSubmitReport = false;
-        if (rumble != null)
-            feed.FeedbackReceived += (_, e) => rumble.Set(e.LargeMotor, e.SmallMotor);
-        feed.Connect();
-
-        string? feedInstanceId = WaitForNewXUsbInstance(before);
-        FeedHidden = feedInstanceId != null && HidHideManager.TryHideFeed(feedInstanceId);
-        if (feedInstanceId == null)
-            AppLogger.Log("DualSense: could not identify the feed controller's instance ID; it won't be hidden from games.");
-
-        try { FeedSlot = feed.UserIndex; } catch { FeedSlot = -1; }
-        AppLogger.Log($"DualSense feed controller connected on XInput slot {FeedSlot}.");
+        IsBluetooth = bluetooth;
         IsConnected = true;
-
         _handle = handle;
         var buffer = new byte[reportLength];
         var gestures = new TouchpadGestureDetector();
@@ -138,8 +141,12 @@ public sealed class DualSenseBridge : IDisposable
                 var report = buffer.AsSpan(0, (int)read);
                 if (DualSenseReport.TryParse(report, bluetooth, out var state))
                 {
-                    ControllerBridge.WriteState(feed, state);
-                    feed.SubmitReport();
+                    lock (_stateLock)
+                    {
+                        _state = state;
+                        _hasState = true;
+                    }
+                    _guideDown = state.Guide;
                 }
 
                 if (DualSenseReport.TryParseTouch(report, bluetooth, out bool touching, out int tx, out int ty, out bool clicked))
@@ -163,20 +170,16 @@ public sealed class DualSenseBridge : IDisposable
         finally
         {
             _handle = null;
-            IsConnected = false;
-            FeedSlot = -1;
+            _rumble = null;
             rumble?.Stop();
-            try
+            lock (_stateLock)
             {
-                ControllerBridge.WriteState(feed, ControllerState.Neutral);
-                feed.SubmitReport();
-                feed.Disconnect();
+                _state = default;
+                _hasState = false;
             }
-            catch { }
-            if (feedInstanceId != null && FeedHidden)
-                HidHideManager.UnhideFeed(feedInstanceId);
-            FeedHidden = false;
-            AppLogger.Log("DualSense feed controller removed.");
+            _guideDown = false;
+            IsConnected = false;
+            AppLogger.Log("DualSense session ended.");
         }
     }
 
@@ -313,36 +316,6 @@ public sealed class DualSenseBridge : IDisposable
                 _handle.Dispose();
             }
         }
-    }
-
-    private static HashSet<string> GetXUsbInstanceIds()
-    {
-        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        try
-        {
-            int index = 0;
-            while (Devcon.FindByInterfaceGuid(DeviceInterfaceIds.XUsbDevice,
-                       out _, out string instanceId, index++, true))
-                ids.Add(instanceId);
-        }
-        catch { }
-        return ids;
-    }
-
-    private string? WaitForNewXUsbInstance(HashSet<string> before)
-    {
-        for (int i = 0; i < 30 && _running; i++)
-        {
-            var added = GetXUsbInstanceIds().Except(before, StringComparer.OrdinalIgnoreCase).ToList();
-            if (added.Count == 1) return added[0];
-            if (added.Count > 1)
-            {
-                AppLogger.Log("DualSense: multiple new Xbox devices appeared at once; not hiding feed.");
-                return null;
-            }
-            Thread.Sleep(100);
-        }
-        return null;
     }
 
     private void Sleep(int ms)

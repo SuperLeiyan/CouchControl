@@ -4,13 +4,13 @@ using System.Runtime.InteropServices;
 namespace CouchControl;
 
 /// <summary>
-/// Ported from GuideTray. Watches every XInput slot for the Guide button (Xbox button,
-/// or the DualSense PS button via the DualSense feed controller):
+/// Ported from GuideTray. Watches every XInput slot for the Guide (Xbox) button, plus the
+/// DualSense PS button reported by <see cref="DualSenseBridge"/>:
 ///   press       → toggle the Windows touch keyboard (fires on release)
 ///   long press  → ignored (≥ 1 s, e.g. holding to power the controller off)
 ///
-/// CouchControl is on HidHide's allow list, so it sees hidden physical pads and the
-/// hidden DualSense feed that a separate app like GuideTray could not.
+/// CouchControl is on HidHide's allow list, so it sees hidden physical pads that a
+/// separate app like GuideTray could not.
 /// </summary>
 public sealed class GuideButtonWatcher : IDisposable
 {
@@ -19,11 +19,16 @@ public sealed class GuideButtonWatcher : IDisposable
     private const int PollIntervalMs = 50;
 
     private readonly Func<bool> _isEnabled;
+    private readonly Func<bool> _isDualSenseGuideDown;
     private Thread? _thread;
     private volatile bool _running;
     private bool _loggedGuideTrayConflict;
 
-    public GuideButtonWatcher(Func<bool> isEnabled) => _isEnabled = isEnabled;
+    public GuideButtonWatcher(Func<bool> isEnabled, Func<bool> isDualSenseGuideDown)
+    {
+        _isEnabled = isEnabled;
+        _isDualSenseGuideDown = isDualSenseGuideDown;
+    }
 
     public void Start()
     {
@@ -42,7 +47,7 @@ public sealed class GuideButtonWatcher : IDisposable
         {
             try
             {
-                bool guideDown = _isEnabled() && IsGuideDownOnAnySlot();
+                bool guideDown = _isEnabled() && (_isDualSenseGuideDown() || IsGuideDownOnAnySlot());
                 var now = DateTime.UtcNow;
 
                 if (guideDown && !wasPressed)

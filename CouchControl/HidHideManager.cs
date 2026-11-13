@@ -10,7 +10,6 @@ namespace CouchControl;
 ///
 ///  • Allow list — adds CouchControl and JoyXoff so they can see hidden controllers.
 ///    Existing entries are never removed.
-///  • Feed — hides CouchControl's own DualSense feed controller from games.
 ///  • Physical controllers (when "Manage HidHide" is on) — hides real Xbox/XInput pads
 ///    and DualSense controllers so games only see CouchControl's virtual controller.
 ///
@@ -25,7 +24,6 @@ internal static class HidHideManager
     private static readonly Regex DualSensePath = new(@"054c[_&]pid[_&](0ce6|0df2)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly object Sync = new();
-    private static readonly HashSet<string> OwnedFeed = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> OwnedDevices = new(StringComparer.OrdinalIgnoreCase);
     private static bool _usable;
 
@@ -84,23 +82,6 @@ internal static class HidHideManager
         }
     }
 
-    // ── Feed controller ───────────────────────────────────────────────────
-
-    public static bool TryHideFeed(string instanceId)
-    {
-        lock (Sync)
-        {
-            if (!TryBlock(instanceId, OwnedFeed)) return false;
-            AppLogger.Log($"HidHide: hid DualSense feed {instanceId} from games.");
-            return true;
-        }
-    }
-
-    public static void UnhideFeed(string instanceId)
-    {
-        lock (Sync) Release(instanceId, OwnedFeed);
-    }
-
     // ── Physical controllers ──────────────────────────────────────────────
 
     /// <summary>Hides any present physical XInput pad or DualSense not already hidden.</summary>
@@ -115,7 +96,7 @@ internal static class HidHideManager
                 var blocked = new HashSet<string>(svc.BlockedInstanceIds, StringComparer.OrdinalIgnoreCase);
                 foreach (var (id, kind) in FindPhysicalControllers())
                 {
-                    if (blocked.Contains(id) || OwnedFeed.Contains(id)) continue;
+                    if (blocked.Contains(id)) continue;
                     svc.AddBlockedInstanceId(id);
                     OwnedDevices.Add(id);
                     SaveOwned();
@@ -148,7 +129,6 @@ internal static class HidHideManager
     private static void ReleaseAllLocked()
     {
         foreach (var id in OwnedDevices.ToList()) Release(id, OwnedDevices);
-        foreach (var id in OwnedFeed.ToList()) Release(id, OwnedFeed);
     }
 
     /// <summary>
@@ -203,29 +183,6 @@ internal static class HidHideManager
 
     // ── Internals ─────────────────────────────────────────────────────────
 
-    private static bool TryBlock(string instanceId, HashSet<string> owner)
-    {
-        if (!_usable)
-        {
-            AppLogger.Log($"HidHide: not usable; {instanceId} stays visible to games.");
-            return false;
-        }
-        try
-        {
-            var svc = new HidHideControlService();
-            if (svc.BlockedInstanceIds.Contains(instanceId, StringComparer.OrdinalIgnoreCase))
-                return true; // already hidden (by the user); don't take ownership
-            svc.AddBlockedInstanceId(instanceId);
-            owner.Add(instanceId);
-            SaveOwned();
-            return true;
-        }
-        catch (Exception ex)
-        {
-            AppLogger.Log($"HidHide: block {instanceId} failed: {ex.Message}");
-            return false;
-        }
-    }
 
     private static void Release(string instanceId, HashSet<string> owner)
     {
@@ -288,7 +245,7 @@ internal static class HidHideManager
         try
         {
             Directory.CreateDirectory(AppPaths.DataDir);
-            File.WriteAllLines(AppPaths.HidHideStateFile, OwnedFeed.Concat(OwnedDevices));
+            File.WriteAllLines(AppPaths.HidHideStateFile, OwnedDevices);
         }
         catch { }
     }
