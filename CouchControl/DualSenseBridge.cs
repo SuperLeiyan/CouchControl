@@ -130,19 +130,34 @@ public sealed class DualSenseBridge : IDisposable
         bool fullReports = false; // set once full (continuous) Bluetooth reports arrive
         bool silent = false;
 
-        // Bluetooth watchdog: cancel the blocking read if a controller that was streaming
-        // full reports goes quiet. Simple reports may only arrive on change, so they don't count.
+        // Bluetooth watchdog. A controller that was streaming full reports can go quiet for
+        // two reasons: it was switched off, or something (e.g. Windows when the touch keyboard
+        // opens) put it back into "simple" mode, which only reports on change. Re-request full
+        // reports: a switched-off controller rejects the write, so only then end the session.
+        int refreshesWithoutData = 0;
         using var watchdog = bluetooth
             ? new System.Threading.Timer(_ =>
             {
-                if (Volatile.Read(ref fullReports) &&
-                    Environment.TickCount64 - Interlocked.Read(ref lastReport) > BluetoothSilenceTimeoutMs)
+                if (!Volatile.Read(ref fullReports) ||
+                    Environment.TickCount64 - Interlocked.Read(ref lastReport) <= BluetoothSilenceTimeoutMs)
                 {
-                    Volatile.Write(ref silent, true);
-                    CancelIoEx(handle, IntPtr.Zero);
+                    refreshesWithoutData = 0;
+                    return;
                 }
+
+                if (rumble != null && refreshesWithoutData < 3 && rumble.Refresh())
+                {
+                    refreshesWithoutData++;
+                    Interlocked.Exchange(ref lastReport, Environment.TickCount64); // give it another window
+                    AppLogger.Log("DualSense went quiet; re-requested full reports.");
+                    return;
+                }
+
+                Volatile.Write(ref silent, true);
+                CancelIoEx(handle, IntPtr.Zero);
             }, null, 500, 500)
             : null;
+        long lastSimpleRefresh = 0;
 
         var buffer = new byte[reportLength];
         var gestures = new TouchpadGestureDetector();
@@ -162,7 +177,21 @@ public sealed class DualSenseBridge : IDisposable
                     break;
                 }
                 Interlocked.Exchange(ref lastReport, Environment.TickCount64);
-                if (bluetooth && read > 0 && buffer[0] == 0x31) Volatile.Write(ref fullReports, true);
+                if (bluetooth && read > 0)
+                {
+                    if (buffer[0] == 0x31)
+                    {
+                        Volatile.Write(ref fullReports, true);
+                    }
+                    else if (buffer[0] == 0x01 && Volatile.Read(ref fullReports) && rumble != null &&
+                             Environment.TickCount64 - lastSimpleRefresh > 1000)
+                    {
+                        // Something switched it back to simple reports (no touchpad data).
+                        lastSimpleRefresh = Environment.TickCount64;
+                        AppLogger.Log("DualSense switched back to simple reports; re-requesting full reports.");
+                        rumble.Refresh();
+                    }
+                }
 
                 if (!gotReport)
                 {
@@ -344,6 +373,23 @@ public sealed class DualSenseBridge : IDisposable
         }
 
         public void Stop() => Set(0, 0);
+
+        /// <summary>
+        /// Re-sends the current rumble state. Any output report also asks a Bluetooth
+        /// DualSense for full input reports. Returns false if the write failed
+        /// (e.g. the controller is switched off).
+        /// </summary>
+        public bool Refresh()
+        {
+            lock (_lock)
+            {
+                if (_disposed) return false;
+                byte large = (byte)(Math.Max(_last, 0) >> 8), small = (byte)(Math.Max(_last, 0) & 0xFF);
+                var report = DualSenseReport.BuildRumbleReport(_bluetooth, _vibrationV2, large, small, _seq, _length);
+                _seq = (byte)((_seq + 1) & 0x0F);
+                return WriteFile(_handle, report, (uint)report.Length, out _, IntPtr.Zero);
+            }
+        }
 
         public void Dispose()
         {

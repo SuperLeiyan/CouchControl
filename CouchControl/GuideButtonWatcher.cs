@@ -253,7 +253,7 @@ internal static class TouchKeyboard
         // Diagnostics: report toggles that didn't change anything.
         _ = Task.Run(async () =>
         {
-            await Task.Delay(400);
+            await Task.Delay(1000);
             if (_monitor != null && _visible == wasVisible)
                 AppLogger.Log($"Touch keyboard toggle had no effect (still {(wasVisible ? "shown" : "hidden")}).");
         });
