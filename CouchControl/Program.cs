@@ -1,6 +1,7 @@
 using System.Windows.Forms;
 using CouchControl;
 
+Application.SetHighDpiMode(HighDpiMode.PerMonitorV2); // sharp on-screen keyboard on scaled displays
 Application.EnableVisualStyles();
 Application.SetCompatibleTextRenderingDefault(false);
 

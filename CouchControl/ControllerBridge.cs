@@ -141,6 +141,7 @@ public sealed class ControllerBridge : IDisposable
     /// <summary>Which physical controller is currently driving the virtual pad.</summary>
     internal enum InputSource { None, XInput, DualSense }
     private bool _keyboardNav; // poll thread only
+    private bool _oskOpen;     // poll thread only
     private volatile InputSource _source = InputSource.None;
 
     public bool IsMuted => _isMuted;
@@ -375,7 +376,7 @@ public sealed class ControllerBridge : IDisposable
         {
             switch (name)
             {
-                case "TouchKeyboard": TouchKeyboard.Toggle(); break;
+                case "TouchKeyboard": KeyboardHost.Toggle(); break;
                 case "ShowDesktop": GuideButtonWatcher.ShowDesktop(); break;
             }
         });
@@ -401,25 +402,47 @@ public sealed class ControllerBridge : IDisposable
                 double dt = Math.Clamp(pollClock.Elapsed.TotalSeconds, 0, 0.05);
                 pollClock.Restart();
 
-                // The physical pads are hidden, so the touch keyboard only sees the virtual pad.
-                // While it's open, the controller drives the keyboard: the virtual pad stays
-                // live (even when games are muted) and desktop mode pauses.
-                bool keyboardNav = TouchKeyboard.IsVisible;
-                if (keyboardNav != _keyboardNav)
+                if (KeyboardHost.BuiltInOpen)
                 {
-                    _keyboardNav = keyboardNav;
-                    AppLogger.Log(keyboardNav
-                        ? "Touch keyboard open: controller now drives the keyboard."
-                        : "Touch keyboard closed: controller back to normal.");
+                    // CouchControl's on-screen keyboard owns the controller while it's open:
+                    // games get nothing and desktop mode pauses.
+                    if (!_oskOpen)
+                    {
+                        _oskOpen = true;
+                        AppLogger.Log("On-screen keyboard open: controller types on it.");
+                    }
+                    lock (_desktopLock) _desktop?.Suspend(ToPadState(raw));
+                    KeyboardHost.Model.Update(raw, Environment.TickCount64, source == InputSource.DualSense);
+                    ApplyState(ControllerState.Neutral);
                 }
-
-                lock (_desktopLock)
+                else
                 {
-                    if (keyboardNav) _desktop?.Suspend(ToPadState(raw));
-                    else _desktop?.Update(ToPadState(raw), dt);
-                }
+                    if (_oskOpen)
+                    {
+                        _oskOpen = false;
+                        AppLogger.Log("On-screen keyboard closed: controller back to normal.");
+                    }
 
-                ApplyState(_isMuted && !keyboardNav ? ControllerState.Neutral : ForGames(raw));
+                    // Windows' touch keyboard (if configured) only sees the virtual pad. While it's
+                    // open, the virtual pad stays live (even when games are muted) and desktop mode
+                    // pauses. This works for a DualSense; Windows cuts off hidden Xbox pads.
+                    bool keyboardNav = TouchKeyboard.IsVisible;
+                    if (keyboardNav != _keyboardNav)
+                    {
+                        _keyboardNav = keyboardNav;
+                        AppLogger.Log(keyboardNav
+                            ? "Touch keyboard open: controller now drives the keyboard."
+                            : "Touch keyboard closed: controller back to normal.");
+                    }
+
+                    lock (_desktopLock)
+                    {
+                        if (keyboardNav) _desktop?.Suspend(ToPadState(raw));
+                        else _desktop?.Update(ToPadState(raw), dt);
+                    }
+
+                    ApplyState(_isMuted && !keyboardNav ? ControllerState.Neutral : ForGames(raw));
+                }
             }
             catch (SharpDX.SharpDXException ex) when (ex.ResultCode.Code == unchecked((int)0x8007001E))
             {

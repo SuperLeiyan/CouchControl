@@ -53,6 +53,7 @@ public sealed class TrayApp : IDisposable
 
         _trayIcon.DoubleClick += (_, _) => ShowStatus();
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        KeyboardHost.Initialize(_ui, () => !_config.UseWindowsTouchKeyboard);
         HidHideManager.ConnectedControllersHidden += OnConnectedControllersHidden;
     }
 
@@ -490,8 +491,8 @@ public sealed class TrayApp : IDisposable
         {
             if (gesture == TouchpadGesture.Tap)
             {
-                AppLogger.Log("Touchpad: tap → touch keyboard");
-                TouchKeyboard.Toggle();
+                AppLogger.Log("Touchpad: tap → keyboard");
+                KeyboardHost.Toggle();
             }
         }
         finally { Interlocked.Exchange(ref _gestureBusy, 0); }

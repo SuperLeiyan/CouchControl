@@ -59,7 +59,7 @@ public sealed class GuideButtonWatcher : IDisposable
                     pressedAt = now;
 
                 if (!guideDown && wasPressed && (now - pressedAt).TotalMilliseconds < LongPressThresholdMs)
-                    Fire("press → touch keyboard", TouchKeyboard.Toggle);
+                    Fire("press → keyboard", KeyboardHost.Toggle);
 
                 wasPressed = guideDown;
             }
