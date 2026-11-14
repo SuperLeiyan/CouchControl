@@ -53,7 +53,7 @@ public sealed class TrayApp : IDisposable
 
         _trayIcon.DoubleClick += (_, _) => ShowStatus();
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
-        KeyboardHost.Initialize(_ui, () => !_config.UseWindowsTouchKeyboard);
+        KeyboardHost.Initialize(_ui, () => !_config.UseWindowsTouchKeyboard, _config.Keyboard, _config.Save);
         HidHideManager.ConnectedControllersHidden += OnConnectedControllersHidden;
     }
 

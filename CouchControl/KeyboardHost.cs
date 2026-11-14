@@ -10,6 +10,8 @@ internal static class KeyboardHost
 {
     private static SynchronizationContext? _ui;
     private static Func<bool> _useBuiltIn = () => true;
+    private static KeyboardSettings _settings = new();
+    private static Action _save = () => { };
     private static OnScreenKeyboardForm? _form;
 
     public static readonly OnScreenKeyboardModel Model = new();
@@ -18,12 +20,15 @@ internal static class KeyboardHost
     public static bool BuiltInOpen => Model.IsOpen;
 
     /// <summary>Call once on the UI thread.</summary>
-    public static void Initialize(SynchronizationContext ui, Func<bool> useBuiltIn)
+    /// <param name="settings">Saved size and position; updated when the keyboard is moved or resized.</param>
+    /// <param name="save">Persists <paramref name="settings"/> (called on the UI thread).</param>
+    public static void Initialize(SynchronizationContext ui, Func<bool> useBuiltIn, KeyboardSettings settings, Action save)
     {
         _ui = ui;
         _useBuiltIn = useBuiltIn;
+        _settings = settings;
+        _save = save;
         Model.CloseRequested += Close;
-        Model.MoveRequested += () => Post(f => f.PlaceOnScreen());
     }
 
     /// <summary>Toggles the keyboard (any thread).</summary>
@@ -65,7 +70,7 @@ internal static class KeyboardHost
         {
             try
             {
-                _form ??= new OnScreenKeyboardForm(Model);
+                _form ??= new OnScreenKeyboardForm(Model, _settings, _save);
                 action(_form);
             }
             catch (Exception ex)

@@ -26,6 +26,9 @@ public sealed class AppConfig
     /// </summary>
     public bool UseWindowsTouchKeyboard { get; set; } = false;
 
+    /// <summary>CouchControl's on-screen keyboard: saved size and position.</summary>
+    public KeyboardSettings Keyboard { get; set; } = new();
+
     /// <summary>Guide/PS button: a press toggles the keyboard.</summary>
     public bool GuideButtonActions { get; set; } = true;
 
