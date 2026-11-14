@@ -40,6 +40,8 @@ internal sealed class OnScreenKeyboardForm : Form
     // Sub-pixel position/size while the sticks move it.
     private double _x, _y, _w, _h;
     private bool _stickActive, _layoutDirty, _wasEditing;
+    private Rectangle _editStartBounds;  // restored when edit mode is cancelled with B
+    private double _editStartOpacity;
     private Point? _dragOffset;
 
     public OnScreenKeyboardForm(OnScreenKeyboardModel model, KeyboardSettings settings, Action save)
@@ -96,8 +98,7 @@ internal sealed class OnScreenKeyboardForm : Form
         else
         {
             _stickTimer.Stop();
-            if (_wasEditing) SaveLayout(); // closed while editing: keep the edit
-            _layoutDirty = false;
+            _layoutDirty = false; // only R3 saves; closing mid-edit discards it
         }
     }
 
@@ -149,17 +150,34 @@ internal sealed class OnScreenKeyboardForm : Form
 
         float mx, my, rx, ry;
         int px, py;
-        bool editing;
+        bool editing, cancelled;
         lock (_model.Sync)
         {
+            cancelled = _model.EditCancelled;
             (mx, my) = _model.RightStick;
             (rx, ry) = _model.LeftStick; // only non-zero in edit mode
             (px, py) = _model.EditDPad;  // only non-zero in edit mode
             editing = _model.Editing;
         }
 
-        if (editing && !_wasEditing) _layoutDirty = true; // R3 then R3 keeps the current spot too
-        if (_wasEditing && !editing) SaveLayout();        // R3 again: save size, position, transparency
+        if (editing && !_wasEditing)
+        {
+            _editStartBounds = Bounds;
+            _editStartOpacity = Opacity;
+            _layoutDirty = true; // R3 then R3 keeps the current spot too
+        }
+        if (_wasEditing && !editing)
+        {
+            if (cancelled) // B: put it back as it was when edit mode started
+            {
+                _layoutDirty = false;
+                _stickActive = false;
+                Opacity = _editStartOpacity;
+                var b = _editStartBounds;
+                SetLayout(b.X, b.Y, b.Width, b.Height, Screen.FromRectangle(b).WorkingArea);
+            }
+            else SaveLayout(); // R3 again: save size, position, transparency
+        }
         _wasEditing = editing;
 
         if (mx == 0 && my == 0 && rx == 0 && ry == 0 && px == 0 && py == 0)
@@ -365,9 +383,7 @@ internal sealed class OnScreenKeyboardForm : Form
         if (_dragOffset == null) return;
         _dragOffset = null;
         Capture = false;
-        bool editing;
-        lock (_model.Sync) editing = _model.Editing;
-        if (editing) SaveLayout(); // like the right stick: only saved in edit mode
+        // Saved with the rest of the edit when R3 leaves edit mode; otherwise only until it closes.
     }
 
     private Font FontFor(float pixels)

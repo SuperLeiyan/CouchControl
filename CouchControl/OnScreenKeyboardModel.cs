@@ -20,7 +20,8 @@ internal sealed record OskKey(string Label, OskAction Action, double Width = 1, 
 ///   View / touchpad click  Esc
 ///   LS click  Shift (double press: Caps)        LT  letters ⇄ symbols    RT  language (not yet)
 ///   Right stick  move the keyboard (not saved)  RS click  edit mode: right stick moves, left
-///       stick resizes, D-pad ↑/↓ transparency, ←/→ narrower/wider; click again to save
+///       stick resizes, D-pad ↑/↓ transparency, ←/→ narrower/wider; click again to save,
+///       B to undo the edit (closing the keyboard mid-edit also discards it)
 /// </summary>
 internal sealed class OnScreenKeyboardModel
 {
@@ -93,6 +94,9 @@ internal sealed class OnScreenKeyboardModel
     /// right stick still moves it, but only until it's closed.
     /// </summary>
     public bool Editing { get; private set; }
+
+    /// <summary>True when edit mode was last left with B (undo the edit) rather than R3 (save it).</summary>
+    public bool EditCancelled { get; private set; }
 
     /// <summary>Sticks after the dead zone, -1..1 each axis, +Y = up. Read by the form's timer.</summary>
     public (float X, float Y) RightStick { get; private set; }
@@ -180,8 +184,8 @@ internal sealed class OnScreenKeyboardModel
     {
         if (Editing)
             return PlayStationLabels
-                ? "Edit: right stick move   left stick size   D-pad ↑↓ transparency  ←→ width   R3 save"
-                : "Edit: right stick move   left stick size   D-pad ↑↓ transparency  ←→ width   RS save";
+                ? "Edit: right stick move   left stick size   D-pad ↑↓ transparency  ←→ width   R3 save   ○ cancel"
+                : "Edit: right stick move   left stick size   D-pad ↑↓ transparency  ←→ width   RS save   B cancel";
         return PlayStationLabels
             ? "✕ type (hold: corner key)   ○ close   right stick move   R3 edit (saved)   ⇧+L1/R1 select"
             : "A type (hold: corner key)   B close   right stick move   RS edit (saved)   ⇧+LB/RB select";
@@ -198,6 +202,7 @@ internal sealed class OnScreenKeyboardModel
             Shift = ShiftMode.Off;
             Ctrl = AltKey = Win = false;
             Editing = false;
+            EditCancelled = false;
             RightStick = LeftStick = (0, 0);
             EditDPad = (0, 0);
             Row = Math.Min(Row, Pages[0].Length - 1);
@@ -263,14 +268,18 @@ internal sealed class OnScreenKeyboardModel
                 if (_dir.Tick(dir != (0, 0), nowMs)) { MoveHighlight(dir.dx, dir.dy); outcome |= Outcome.Changed; }
 
                 outcome |= HandleA(Pressed(PadButton.A), Has(released, PadButton.A), nowMs);
-                if (Pressed(PadButton.B)) outcome |= Outcome.Close;
+                if (Pressed(PadButton.B))
+                {
+                    if (Editing) { Editing = false; EditCancelled = true; outcome |= Outcome.Changed; } // undo the edit
+                    else outcome |= Outcome.Close;
+                }
                 if (_backspace.Tick(Has(bits, PadButton.X), nowMs)) outcome |= Activate(Backspace);
                 if (Pressed(PadButton.Y)) outcome |= Activate(new("Space", OskAction.Space));
                 if (Pressed(PadButton.Start)) outcome |= Activate(EnterKey);
                 if (_left.Tick(Has(bits, PadButton.LB), nowMs)) outcome |= Activate(CursorLeft);
                 if (_right.Tick(Has(bits, PadButton.RB), nowMs)) outcome |= Activate(CursorRight);
                 if (Pressed(PadButton.LS)) outcome |= Activate(ShiftKey);
-                if (Pressed(PadButton.RS)) { Editing = !Editing; outcome |= Outcome.Changed; }
+                if (Pressed(PadButton.RS)) { Editing = !Editing; EditCancelled = false; outcome |= Outcome.Changed; }
                 if (Pressed(PadButton.Back)) outcome |= Activate(Esc); // View / touchpad click
                 if (lt && !_ltDown) outcome |= Activate(new("&123", OskAction.Page));
                 if (rt && !_rtDown) outcome |= Activate(Language);
