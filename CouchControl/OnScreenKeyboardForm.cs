@@ -10,8 +10,8 @@ namespace CouchControl;
 /// <summary>
 /// Draws <see cref="OnScreenKeyboardModel"/>. A topmost window that never takes focus, so keys
 /// go to the app you're typing in. Mouse clicks on keys work too (right click: corner character).
-/// The right stick moves it; in resize mode the right stick resizes it. Size and position are
-/// saved in <see cref="KeyboardSettings"/>.
+/// The right stick moves it for the current session. In edit mode (R3) the right stick moves it,
+/// the left stick resizes it, and leaving edit mode saves both in <see cref="KeyboardSettings"/>.
 /// </summary>
 internal sealed class OnScreenKeyboardForm : Form
 {
@@ -36,7 +36,7 @@ internal sealed class OnScreenKeyboardForm : Form
 
     // Sub-pixel position/size while the stick moves it.
     private double _x, _y, _w;
-    private bool _stickActive, _layoutDirty, _wasResizing;
+    private bool _stickActive, _layoutDirty, _wasEditing;
     private Point? _dragOffset;
 
     public OnScreenKeyboardForm(OnScreenKeyboardModel model, KeyboardSettings settings, Action save)
@@ -84,15 +84,17 @@ internal sealed class OnScreenKeyboardForm : Form
         base.OnVisibleChanged(e);
         if (Visible)
         {
-            _wasResizing = false;
+            _wasEditing = false;
             _stickActive = false;
+            _layoutDirty = false;
             _clock.Restart();
             _stickTimer.Start();
         }
         else
         {
             _stickTimer.Stop();
-            SaveLayout();
+            if (_wasEditing) SaveLayout(); // closed while editing: keep the edit
+            _layoutDirty = false;
         }
     }
 
@@ -140,20 +142,21 @@ internal sealed class OnScreenKeyboardForm : Form
         double dt = Math.Min(0.05, _clock.Elapsed.TotalSeconds);
         _clock.Restart();
 
-        float sx, sy;
-        bool resizing;
+        float mx, my, rx, ry;
+        bool editing;
         lock (_model.Sync)
         {
-            (sx, sy) = _model.RightStick;
-            resizing = _model.Resizing;
+            (mx, my) = _model.RightStick;
+            (rx, ry) = _model.LeftStick; // only non-zero in edit mode
+            editing = _model.Editing;
         }
 
-        if (_wasResizing && !resizing) SaveLayout(); // R3 again: keep this size
-        _wasResizing = resizing;
+        if (editing && !_wasEditing) _layoutDirty = true; // R3 then R3 keeps the current spot too
+        if (_wasEditing && !editing) SaveLayout();        // R3 again: save size and position
+        _wasEditing = editing;
 
-        if (sx == 0 && sy == 0)
+        if (mx == 0 && my == 0 && rx == 0 && ry == 0)
         {
-            if (_stickActive && !resizing) SaveLayout(); // stick back to centre: keep this spot
             _stickActive = false;
             return;
         }
@@ -165,25 +168,26 @@ internal sealed class OnScreenKeyboardForm : Form
             _stickActive = true;
         }
 
-        var wa = Screen.FromRectangle(Bounds).WorkingArea;
-        if (resizing)
+        if (rx != 0 || ry != 0)
         {
-            // Right / up grows, left / down shrinks; the centre stays put.
-            float grow = Math.Abs(sx) >= Math.Abs(sy) ? sx : sy;
+            // Left stick right / up grows, left / down shrinks; the centre stays put.
+            var wa = Screen.FromRectangle(Bounds).WorkingArea;
+            float grow = Math.Abs(rx) >= Math.Abs(ry) ? rx : ry;
             double newW = Math.Clamp(_w + grow * ResizePxPerSec * dt, Math.Min(MinWidth, wa.Width), wa.Width);
             double cx = _x + _w / 2, cy = _y + HeightFor((int)_w) / 2.0;
             SetLayout(cx - newW / 2, cy - HeightFor((int)newW) / 2.0, newW, wa);
         }
-        else
+
+        if (mx != 0 || my != 0)
         {
             // Allow crossing to another monitor: clamp to the whole desktop while moving.
             var desk = SystemInformation.VirtualScreen;
-            double nx = Math.Clamp(_x + sx * MovePxPerSec * dt, desk.Left, desk.Right - _w);
-            double ny = Math.Clamp(_y - sy * MovePxPerSec * dt, desk.Top, desk.Bottom - Height); // XInput +Y = up
+            double nx = Math.Clamp(_x + mx * MovePxPerSec * dt, desk.Left, desk.Right - _w);
+            double ny = Math.Clamp(_y - my * MovePxPerSec * dt, desk.Top, desk.Bottom - Height); // XInput +Y = up
             _x = nx; _y = ny;
             Location = new Point((int)Math.Round(nx), (int)Math.Round(ny));
         }
-        _layoutDirty = true;
+        if (editing) _layoutDirty = true; // outside edit mode, moves last only until it closes
     }
 
     /// <summary>Saves the current size and position if they changed.</summary>
@@ -269,9 +273,9 @@ internal sealed class OnScreenKeyboardForm : Form
             using (var barBrush = new SolidBrush(BarColor)) g.FillRectangle(barBrush, BarRect());
             var close = CloseRect();
             var hintRect = new RectangleF(pad * 2, pad / 2, close.Left - pad * 3, barH);
-            g.DrawString(_model.Hints(), barFont, _model.Resizing ? accentBrush : hintBrush, hintRect, leftMiddle);
+            g.DrawString(_model.Hints(), barFont, _model.Editing ? accentBrush : hintBrush, hintRect, leftMiddle);
             g.DrawString("✕", barFont, textBrush, close, centered);
-            if (_model.Resizing)
+            if (_model.Editing)
                 using (var pen = new Pen(Accent, Math.Max(2f, pad * 0.4f))) g.DrawRectangle(pen, 1, 1, ClientSize.Width - 2, ClientSize.Height - 2);
 
             foreach (var (row, col, key, rect) in KeyRects())
@@ -323,7 +327,7 @@ internal sealed class OnScreenKeyboardForm : Form
         if (_dragOffset is not { } offset) return;
         var p = PointToScreen(e.Location);
         Location = new Point(p.X - offset.X, p.Y - offset.Y);
-        _layoutDirty = true;
+        lock (_model.Sync) if (_model.Editing) _layoutDirty = true;
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
@@ -332,7 +336,9 @@ internal sealed class OnScreenKeyboardForm : Form
         if (_dragOffset == null) return;
         _dragOffset = null;
         Capture = false;
-        SaveLayout();
+        bool editing;
+        lock (_model.Sync) editing = _model.Editing;
+        if (editing) SaveLayout(); // like the right stick: only saved in edit mode
     }
 
     private Font FontFor(float pixels)

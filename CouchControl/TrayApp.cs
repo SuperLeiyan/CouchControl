@@ -259,7 +259,7 @@ public sealed class TrayApp : IDisposable
         {
             Checked = _config.TouchpadGestures,
             CheckOnClick = true,
-            ToolTipText = "Tap (without clicking): toggle touch keyboard."
+            ToolTipText = "Double tap (without clicking): open or close the keyboard."
         };
         touchpadItem.CheckedChanged += (_, _) =>
         {
@@ -489,9 +489,9 @@ public sealed class TrayApp : IDisposable
         if (Interlocked.Exchange(ref _gestureBusy, 1) == 1) return;
         try
         {
-            if (gesture == TouchpadGesture.Tap)
+            if (gesture == TouchpadGesture.DoubleTap)
             {
-                AppLogger.Log("Touchpad: tap → keyboard");
+                AppLogger.Log("Touchpad: double tap → keyboard");
                 KeyboardHost.Toggle();
             }
         }

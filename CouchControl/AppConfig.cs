@@ -32,7 +32,7 @@ public sealed class AppConfig
     /// <summary>Guide/PS button: a press toggles the keyboard.</summary>
     public bool GuideButtonActions { get; set; } = true;
 
-    /// <summary>DualSense touchpad: a tap (touch without clicking) toggles the touch keyboard.</summary>
+    /// <summary>DualSense touchpad: a double tap (touches without clicking) toggles the keyboard.</summary>
     public bool TouchpadGestures { get; set; } = true;
 
     /// <summary>

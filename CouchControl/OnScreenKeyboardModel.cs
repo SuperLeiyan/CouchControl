@@ -19,8 +19,8 @@ internal sealed record OskKey(string Label, OskAction Action, double Width = 1, 
 ///   LB / RB  cursor left / right (select text while Shift is on)
 ///   View / touchpad click  Esc
 ///   LS click  Shift (double press: Caps)        LT  letters ⇄ symbols    RT  language (not yet)
-///   Right stick  move the keyboard              RS click  resize mode (right stick resizes,
-///                                                         click again to save)
+///   Right stick  move the keyboard (not saved)  RS click  edit mode: right stick moves, left
+///                                                         stick resizes, click again to save
 /// </summary>
 internal sealed class OnScreenKeyboardModel
 {
@@ -87,11 +87,16 @@ internal sealed class OnScreenKeyboardModel
     public bool Win { get; private set; }
     public bool PlayStationLabels { get; private set; }
 
-    /// <summary>R3 toggles this: the right stick resizes instead of moving the keyboard.</summary>
-    public bool Resizing { get; private set; }
+    /// <summary>
+    /// R3 toggles edit mode: the right stick moves and the left stick resizes the keyboard,
+    /// and leaving edit mode (R3 again) saves its size and position. Outside edit mode the
+    /// right stick still moves it, but only until it's closed.
+    /// </summary>
+    public bool Editing { get; private set; }
 
-    /// <summary>Right stick after the dead zone, -1..1 each axis, +Y = up. Read by the form's timer.</summary>
+    /// <summary>Sticks after the dead zone, -1..1 each axis, +Y = up. Read by the form's timer.</summary>
     public (float X, float Y) RightStick { get; private set; }
+    public (float X, float Y) LeftStick { get; private set; }
 
     /// <summary>Set by <see cref="KeyboardHost"/> on the UI thread; read by the poll thread.</summary>
     public volatile bool IsOpen;
@@ -170,13 +175,13 @@ internal sealed class OnScreenKeyboardModel
 
     public string Hints()
     {
-        if (Resizing)
+        if (Editing)
             return PlayStationLabels
-                ? "Resizing: right stick → bigger, ← smaller   R3 save"
-                : "Resizing: right stick → bigger, ← smaller   RS save";
+                ? "Edit: right stick move   left stick → bigger, ← smaller   R3 save"
+                : "Edit: right stick move   left stick → bigger, ← smaller   RS save";
         return PlayStationLabels
-            ? "✕ type (hold: corner key)   ○ close   right stick move   R3 resize   ⇧+L1/R1 select"
-            : "A type (hold: corner key)   B close   right stick move   RS resize   ⇧+LB/RB select";
+            ? "✕ type (hold: corner key)   ○ close   right stick move   R3 edit (saved)   ⇧+L1/R1 select"
+            : "A type (hold: corner key)   B close   right stick move   RS edit (saved)   ⇧+LB/RB select";
     }
 
     /// <summary>Call when the keyboard opens: buttons held right now won't fire.</summary>
@@ -189,8 +194,8 @@ internal sealed class OnScreenKeyboardModel
             Page = 0;
             Shift = ShiftMode.Off;
             Ctrl = AltKey = Win = false;
-            Resizing = false;
-            RightStick = (0, 0);
+            Editing = false;
+            RightStick = LeftStick = (0, 0);
             Row = Math.Min(Row, Pages[0].Length - 1);
             Col = Math.Min(Col, Pages[0][Row].Length - 1);
         }
@@ -199,7 +204,7 @@ internal sealed class OnScreenKeyboardModel
 
     // ── Controller input (poll thread) ───────────────────────────────────
 
-    private const int StickThreshold = 18000, RightStickDeadZone = 7000;
+    private const int StickThreshold = 18000, StickDeadZone = 7000;
     private const byte TriggerPress = 140, TriggerRelease = 100;
     private const long HoldMs = 500, DoubleShiftMs = 400;
     private ushort _prev;
@@ -226,6 +231,7 @@ internal sealed class OnScreenKeyboardModel
             bool rt = _rtDown ? s.RightTrigger > TriggerRelease : s.RightTrigger > TriggerPress;
             bool lt = _ltDown ? s.LeftTrigger > TriggerRelease : s.LeftTrigger > TriggerPress;
             RightStick = (Curve(s.RightThumbX), Curve(s.RightThumbY));
+            LeftStick = Editing ? (Curve(s.LeftThumbX), Curve(s.LeftThumbY)) : (0, 0);
 
             if (!_started)
             {
@@ -234,7 +240,7 @@ internal sealed class OnScreenKeyboardModel
                 _prev = bits;
                 _rtDown = rt;
                 _ltDown = lt;
-                _lastDir = Direction(s, bits);
+                _lastDir = Direction(s, bits, Editing);
                 _dir.Hold(_lastDir != (0, 0), nowMs);
                 _backspace.Hold(Has(bits, PadButton.X), nowMs);
                 _left.Hold(Has(bits, PadButton.LB), nowMs);
@@ -247,7 +253,7 @@ internal sealed class OnScreenKeyboardModel
                 _prev = bits;
                 bool Pressed(PadButton b) => Has(pressed, b);
 
-                var dir = Direction(s, bits);
+                var dir = Direction(s, bits, Editing); // in edit mode the left stick resizes instead
                 if (dir != _lastDir) { _lastDir = dir; _dir.Reset(); }
                 if (_dir.Tick(dir != (0, 0), nowMs)) { MoveHighlight(dir.dx, dir.dy); outcome |= Outcome.Changed; }
 
@@ -259,7 +265,7 @@ internal sealed class OnScreenKeyboardModel
                 if (_left.Tick(Has(bits, PadButton.LB), nowMs)) outcome |= Activate(CursorLeft);
                 if (_right.Tick(Has(bits, PadButton.RB), nowMs)) outcome |= Activate(CursorRight);
                 if (Pressed(PadButton.LS)) outcome |= Activate(ShiftKey);
-                if (Pressed(PadButton.RS)) { Resizing = !Resizing; outcome |= Outcome.Changed; }
+                if (Pressed(PadButton.RS)) { Editing = !Editing; outcome |= Outcome.Changed; }
                 if (Pressed(PadButton.Back)) outcome |= Activate(Esc); // View / touchpad click
                 if (lt && !_ltDown) outcome |= Activate(new("&123", OskAction.Page));
                 if (rt && !_rtDown) outcome |= Activate(Language);
@@ -317,19 +323,20 @@ internal sealed class OnScreenKeyboardModel
     private static float Curve(short v)
     {
         int a = Math.Abs((int)v);
-        if (a < RightStickDeadZone) return 0;
-        float t = Math.Min(1f, (a - RightStickDeadZone) / (32767f - RightStickDeadZone));
+        if (a < StickDeadZone) return 0;
+        float t = Math.Min(1f, (a - StickDeadZone) / (32767f - StickDeadZone));
         return Math.Sign(v) * t * t;
     }
 
-    /// <summary>D-pad wins; otherwise the left stick's dominant axis. dy = -1 means up.</summary>
-    private static (int dx, int dy) Direction(ControllerState s, ushort bits)
+    /// <summary>D-pad wins; otherwise the left stick's dominant axis (unless it's resizing). dy = -1 means up.</summary>
+    private static (int dx, int dy) Direction(ControllerState s, ushort bits, bool editing)
     {
         if (Has(bits, PadButton.DPadUp)) return (0, -1);
         if (Has(bits, PadButton.DPadDown)) return (0, 1);
         if (Has(bits, PadButton.DPadLeft)) return (-1, 0);
         if (Has(bits, PadButton.DPadRight)) return (1, 0);
 
+        if (editing) return (0, 0);
         int x = s.LeftThumbX, y = s.LeftThumbY;
         if (Math.Max(Math.Abs(x), Math.Abs(y)) < StickThreshold) return (0, 0);
         return Math.Abs(x) >= Math.Abs(y) ? (Math.Sign(x), 0) : (0, -Math.Sign(y)); // XInput +Y = up
