@@ -28,8 +28,6 @@ internal sealed class OnScreenKeyboardModel
     /// <summary>Every row is this many key units wide, so rows line up for D-pad navigation.</summary>
     public const double RowUnits = 13;
 
-    public static readonly OskKey[][][] Pages = [Letters(), Symbols()];
-
     private static OskKey C(char c, char alt = '\0') => new(c.ToString(), OskAction.Char, 1, c, alt);
     private static OskKey[] Chars(string s) => s.Select(c => C(c)).ToArray();
 
@@ -42,6 +40,9 @@ internal sealed class OnScreenKeyboardModel
     private static readonly OskKey CursorLeft = new("‹", OskAction.Left);
     private static readonly OskKey CursorRight = new("›", OskAction.Right);
     private static readonly OskKey Language = new("ENG", OskAction.Language, 1.5);
+
+    // Must come after the shared keys above: static fields initialise in source order.
+    public static readonly OskKey[][][] Pages = [Letters(), Symbols()];
 
     private static OskKey[][] Letters() =>
     [
