@@ -60,7 +60,7 @@ internal static class DualSenseReport
             Y:             (b0 & 0x80) != 0,   // Triangle
             LeftShoulder:  (b1 & 0x01) != 0,   // L1
             RightShoulder: (b1 & 0x02) != 0,   // R1
-            Back:          (b1 & 0x10) != 0 || (b2 & 0x02) != 0, // Create or touchpad click
+            Back:          (b2 & 0x02) != 0,   // Touchpad click (Create is deliberately unused)
             Start:         (b1 & 0x20) != 0,   // Options
             LeftThumb:     (b1 & 0x40) != 0,   // L3
             RightThumb:    (b1 & 0x80) != 0,   // R3
@@ -94,6 +94,83 @@ internal static class DualSenseReport
         y = (report[touch + 2] >> 4) | (report[touch + 3] << 4);
         clicked = (report[buttons + 2] & 0x02) != 0;
         return true;
+    }
+
+    // ── Rumble (output report) ────────────────────────────────────────────
+    // Layout follows the Linux hid-playstation driver. Common section offsets:
+    //   0 valid_flag0, 1 valid_flag1, 2 motor_right (weak), 3 motor_left (strong), 38 valid_flag2
+
+    public const int UsbOutputReportSize = 48; // report ID 0x02 + 47-byte common section
+    public const int BtOutputReportSize = 78;  // 0x31, seq, tag, common, padding, CRC32
+
+    private const byte HapticsSelect = 0x02;          // valid_flag0: classic rumble haptics
+    private const byte CompatibleVibration = 0x01;    // valid_flag0: rumble, older firmware
+    private const byte CompatibleVibration2 = 0x04;   // valid_flag2: rumble, firmware ≥ 2.21 / Edge
+
+    /// <summary>
+    /// Builds a DualSense output report that sets only the rumble motors.
+    /// <paramref name="bufferLength"/> is the HID output report length Windows expects;
+    /// the report is zero-padded to it.
+    /// </summary>
+    public static byte[] BuildRumbleReport(bool bluetooth, bool vibrationV2,
+        byte largeMotor, byte smallMotor, byte seq, int bufferLength)
+    {
+        var r = new byte[Math.Max(bufferLength, bluetooth ? BtOutputReportSize : UsbOutputReportSize)];
+        int c;
+        if (bluetooth)
+        {
+            r[0] = 0x31;
+            r[1] = (byte)((seq & 0x0F) << 4);
+            r[2] = 0x10; // required tag
+            c = 3;
+        }
+        else
+        {
+            r[0] = 0x02;
+            c = 1;
+        }
+
+        r[c] = HapticsSelect;
+        if (vibrationV2) r[c + 38] = CompatibleVibration2;
+        else r[c] |= CompatibleVibration;
+        r[c + 2] = smallMotor;
+        r[c + 3] = largeMotor;
+
+        if (bluetooth)
+        {
+            uint crc = Crc32(0xA2, r.AsSpan(0, BtOutputReportSize - 4));
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(r.AsSpan(BtOutputReportSize - 4), crc);
+        }
+        return r;
+    }
+
+    /// <summary>
+    /// Reads the "update version" from feature report 0x20 (firmware info).
+    /// Returns null if the report is too short.
+    /// </summary>
+    public static ushort? ParseUpdateVersion(ReadOnlySpan<byte> firmwareInfo)
+        => firmwareInfo.Length >= 46
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(firmwareInfo[44..])
+            : null;
+
+    /// <summary>Feature version 2.21 introduced the newer rumble method.</summary>
+    public const ushort VibrationV2MinVersion = (2 << 8) | 21;
+
+    /// <summary>Standard CRC-32 over a one-byte seed followed by <paramref name="data"/>.</summary>
+    internal static uint Crc32(byte seed, ReadOnlySpan<byte> data)
+    {
+        uint crc = 0xFFFFFFFF;
+        crc = Crc32Update(crc, seed);
+        foreach (byte b in data) crc = Crc32Update(crc, b);
+        return ~crc;
+    }
+
+    private static uint Crc32Update(uint crc, byte b)
+    {
+        crc ^= b;
+        for (int i = 0; i < 8; i++)
+            crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
+        return crc;
     }
 
     /// <summary>

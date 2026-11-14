@@ -10,13 +10,15 @@ namespace CouchControl;
 ///
 ///  • Allow list — adds CouchControl and JoyXoff so they can see hidden controllers.
 ///    Existing entries are never removed.
-///  • Feed — hides CouchControl's own DualSense feed controller from games.
 ///  • Physical controllers (when "Manage HidHide" is on) — hides real Xbox/XInput pads
 ///    and DualSense controllers so games only see CouchControl's virtual controller.
 ///
-/// Only instance IDs CouchControl added itself are tracked as "owned". Owned entries are
-/// removed when CouchControl exits (so controllers behave normally without it) and on the
-/// next start after a crash. Devices the user hid manually are left alone.
+/// Only instance IDs CouchControl added itself are tracked as "owned". Owned entries stay
+/// hidden after CouchControl exits: HidHide can't take a device away from an app that
+/// opened it while it was visible (Windows components do this within moments), so
+/// un-hiding between runs would let them read the physical pad past the mute again.
+/// They're re-adopted on the next start, and un-hidden when "Manage HidHide" is turned
+/// off. Devices the user hid manually are left alone.
 /// </summary>
 internal static class HidHideManager
 {
@@ -25,7 +27,6 @@ internal static class HidHideManager
     private static readonly Regex DualSensePath = new(@"054c[_&]pid[_&](0ce6|0df2)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly object Sync = new();
-    private static readonly HashSet<string> OwnedFeed = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> OwnedDevices = new(StringComparer.OrdinalIgnoreCase);
     private static bool _usable;
 
@@ -39,7 +40,7 @@ internal static class HidHideManager
     {
         lock (Sync)
         {
-            RemoveStaleEntries();
+            LoadOwnedEntries(keep: manage);
 
             try
             {
@@ -84,27 +85,25 @@ internal static class HidHideManager
         }
     }
 
-    // ── Feed controller ───────────────────────────────────────────────────
-
-    public static bool TryHideFeed(string instanceId)
-    {
-        lock (Sync)
-        {
-            if (!TryBlock(instanceId, OwnedFeed)) return false;
-            AppLogger.Log($"HidHide: hid DualSense feed {instanceId} from games.");
-            return true;
-        }
-    }
-
-    public static void UnhideFeed(string instanceId)
-    {
-        lock (Sync) Release(instanceId, OwnedFeed);
-    }
-
     // ── Physical controllers ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Raised (outside the lock, on the caller's thread) with the kinds of controllers that
+    /// were just hidden while already connected. Windows may have opened them while they
+    /// were visible, so they need reconnecting once for the hiding to fully take effect.
+    /// </summary>
+    public static event Action<IReadOnlyList<string>>? ConnectedControllersHidden;
 
     /// <summary>Hides any present physical XInput pad or DualSense not already hidden.</summary>
     public static void HidePhysicalControllers()
+    {
+        var newlyHidden = new List<string>();
+        HidePhysicalControllersLocked(newlyHidden);
+        if (newlyHidden.Count > 0)
+            ConnectedControllersHidden?.Invoke(newlyHidden.Distinct().ToList());
+    }
+
+    private static void HidePhysicalControllersLocked(List<string> newlyHidden)
     {
         lock (Sync)
         {
@@ -115,19 +114,37 @@ internal static class HidHideManager
                 var blocked = new HashSet<string>(svc.BlockedInstanceIds, StringComparer.OrdinalIgnoreCase);
                 foreach (var (id, kind) in FindPhysicalControllers())
                 {
-                    if (blocked.Contains(id) || OwnedFeed.Contains(id)) continue;
-                    svc.AddBlockedInstanceId(id);
+                    if (blocked.Contains(id)) continue;
+                    // Record ownership before hiding, so a crash in between can't leave an
+                    // entry hidden that CouchControl doesn't know about.
                     OwnedDevices.Add(id);
                     SaveOwned();
+                    svc.AddBlockedInstanceId(id);
+                    newlyHidden.Add(kind.StartsWith("Xbox", StringComparison.Ordinal) ? "Xbox controller" : kind);
                     AppLogger.Log($"HidHide: hid {kind} {id} from games.");
                 }
             }
             catch (Exception ex)
             {
-                AppLogger.Log($"HidHide: hiding physical controllers failed: {ex.Message}");
+                // This runs every 2 s. HidHide's driver allows one client at a time, so it fails
+                // while e.g. the HidHide Configuration Client is open; log once until it recovers.
+                if (!_hideFailureLogged)
+                {
+                    _hideFailureLogged = true;
+                    AppLogger.Log($"HidHide: hiding physical controllers failed: {ex.Message.Split('\n')[0].Trim()} " +
+                        "(Is the HidHide Configuration Client open? Close it so CouchControl can manage HidHide.) Retrying quietly.");
+                }
+                return;
+            }
+            if (_hideFailureLogged)
+            {
+                _hideFailureLogged = false;
+                AppLogger.Log("HidHide: access restored.");
             }
         }
     }
+
+    private static bool _hideFailureLogged;
 
     /// <summary>Un-hides the physical controllers CouchControl hid (not the user's own entries).</summary>
     public static void ReleasePhysicalControllers()
@@ -139,16 +156,9 @@ internal static class HidHideManager
         }
     }
 
-    /// <summary>Removes every entry CouchControl owns. Call on exit.</summary>
-    public static void ReleaseAll()
-    {
-        lock (Sync) ReleaseAllLocked();
-    }
-
     private static void ReleaseAllLocked()
     {
         foreach (var id in OwnedDevices.ToList()) Release(id, OwnedDevices);
-        foreach (var id in OwnedFeed.ToList()) Release(id, OwnedFeed);
     }
 
     /// <summary>
@@ -203,57 +213,52 @@ internal static class HidHideManager
 
     // ── Internals ─────────────────────────────────────────────────────────
 
-    private static bool TryBlock(string instanceId, HashSet<string> owner)
-    {
-        if (!_usable)
-        {
-            AppLogger.Log($"HidHide: not usable; {instanceId} stays visible to games.");
-            return false;
-        }
-        try
-        {
-            var svc = new HidHideControlService();
-            if (svc.BlockedInstanceIds.Contains(instanceId, StringComparer.OrdinalIgnoreCase))
-                return true; // already hidden (by the user); don't take ownership
-            svc.AddBlockedInstanceId(instanceId);
-            owner.Add(instanceId);
-            SaveOwned();
-            return true;
-        }
-        catch (Exception ex)
-        {
-            AppLogger.Log($"HidHide: block {instanceId} failed: {ex.Message}");
-            return false;
-        }
-    }
 
     private static void Release(string instanceId, HashSet<string> owner)
     {
-        if (!owner.Remove(instanceId)) return;
+        if (!owner.Contains(instanceId)) return;
         try
         {
             var svc = new HidHideControlService();
             if (svc.IsInstalled) svc.RemoveBlockedInstanceId(instanceId);
+            owner.Remove(instanceId);
             AppLogger.Log($"HidHide: un-hid {instanceId}.");
         }
         catch (Exception ex)
         {
-            AppLogger.Log($"HidHide: unblock {instanceId} failed: {ex.Message}");
+            // Keep ownership: the entry stays in the state file, so the next start's
+            // stale-entry cleanup un-hides it.
+            AppLogger.Log($"HidHide: unblock {instanceId} failed: {ex.Message.Split('\n')[0].Trim()} Will retry on next start.");
         }
         SaveOwned();
     }
 
-    private static void RemoveStaleEntries()
+    /// <summary>
+    /// Reads the entries a previous run hid. With <paramref name="keep"/> (Manage HidHide on)
+    /// they're adopted again and stay hidden; otherwise they're un-hidden. Entries that now
+    /// belong to a ViGEm virtual pad (instance IDs can be reused) and X-Mute's old feed
+    /// entry are always removed.
+    /// </summary>
+    private static void LoadOwnedEntries(bool keep)
     {
+        var owned = new List<string>();
         var stale = new List<string>();
         try
         {
             if (File.Exists(AppPaths.HidHideStateFile))
-                stale.AddRange(File.ReadAllLines(AppPaths.HidHideStateFile));
+                owned.AddRange(File.ReadAllLines(AppPaths.HidHideStateFile));
             if (File.Exists(AppPaths.LegacyHidHideFeedFile))
                 stale.AddRange(File.ReadAllLines(AppPaths.LegacyHidHideFeedFile));
         }
         catch { }
+
+        foreach (var id in owned.Select(s => s.Trim()).Where(s => s.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (keep && !IsPresentViGEmDevice(id)) OwnedDevices.Add(id);
+            else stale.Add(id);
+        }
+        if (OwnedDevices.Count > 0)
+            AppLogger.Log($"HidHide: keeping {OwnedDevices.Count} controller(s) hidden from the previous run.");
 
         stale = stale.Select(s => s.Trim()).Where(s => s.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         if (stale.Count > 0)
@@ -271,16 +276,27 @@ internal static class HidHideManager
             catch (Exception ex)
             {
                 AppLogger.Log($"HidHide: stale cleanup failed: {ex.Message}");
-                return; // keep the file so we retry next start
+                return; // keep the files so we retry next start
             }
         }
 
-        try
-        {
-            if (File.Exists(AppPaths.HidHideStateFile)) File.Delete(AppPaths.HidHideStateFile);
-            if (File.Exists(AppPaths.LegacyHidHideFeedFile)) File.Delete(AppPaths.LegacyHidHideFeedFile);
-        }
+        // Rewrite (never just delete) the state file, so a crash or kill from here on still
+        // leaves a record of every entry we own.
+        SaveOwned();
+        try { if (File.Exists(AppPaths.LegacyHidHideFeedFile)) File.Delete(AppPaths.LegacyHidHideFeedFile); }
         catch { }
+    }
+
+    /// <summary>
+    /// True only if the device is present and driven by ViGEmBus (i.e. the instance ID now
+    /// belongs to a virtual pad). Unlike <see cref="IsUnderViGEmBus"/>, a device that isn't
+    /// present (a switched-off controller) counts as false.
+    /// </summary>
+    private static bool IsPresentViGEmDevice(string instanceId)
+    {
+        try { PnPDevice.GetDeviceByInstanceId(instanceId, DeviceLocationFlags.Normal); }
+        catch { return false; }
+        return IsUnderViGEmBus(instanceId);
     }
 
     private static void SaveOwned()
@@ -288,7 +304,7 @@ internal static class HidHideManager
         try
         {
             Directory.CreateDirectory(AppPaths.DataDir);
-            File.WriteAllLines(AppPaths.HidHideStateFile, OwnedFeed.Concat(OwnedDevices));
+            File.WriteAllLines(AppPaths.HidHideStateFile, OwnedDevices);
         }
         catch { }
     }

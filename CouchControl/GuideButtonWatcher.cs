@@ -4,28 +4,36 @@ using System.Runtime.InteropServices;
 namespace CouchControl;
 
 /// <summary>
-/// Ported from GuideTray. Watches every XInput slot for the Guide button (Xbox button,
-/// or the DualSense PS button via the DualSense feed controller):
-///   single tap  → toggle the Windows touch keyboard
-///   double tap  → show desktop
+/// Ported from GuideTray. Watches every XInput slot for the Guide (Xbox) button, plus the
+/// DualSense PS button reported by <see cref="DualSenseBridge"/>:
+///   press       → toggle the Windows touch keyboard (fires on release)
 ///   long press  → ignored (≥ 1 s, e.g. holding to power the controller off)
 ///
-/// CouchControl is on HidHide's allow list, so it sees hidden physical pads and the
-/// hidden DualSense feed that a separate app like GuideTray could not.
+/// CouchControl is on HidHide's allow list, so it sees hidden physical pads that a
+/// separate app like GuideTray could not.
 /// </summary>
 public sealed class GuideButtonWatcher : IDisposable
 {
     private const ushort GuideButton = 0x0400;
     private const int LongPressThresholdMs = 1000;
-    private const int DoubleTapWindowMs = 400;
     private const int PollIntervalMs = 50;
 
     private readonly Func<bool> _isEnabled;
+    private readonly Func<bool> _isDualSenseGuideDown;
+    private readonly Func<int> _activeXInputSlot;
     private Thread? _thread;
     private volatile bool _running;
     private bool _loggedGuideTrayConflict;
 
-    public GuideButtonWatcher(Func<bool> isEnabled) => _isEnabled = isEnabled;
+    /// <summary>Only the controller in control can toggle the keyboard.</summary>
+    /// <param name="isDualSenseGuideDown">PS button held on the DualSense in control.</param>
+    /// <param name="activeXInputSlot">Slot of the Xbox controller in control, or -1.</param>
+    public GuideButtonWatcher(Func<bool> isEnabled, Func<bool> isDualSenseGuideDown, Func<int> activeXInputSlot)
+    {
+        _isEnabled = isEnabled;
+        _isDualSenseGuideDown = isDualSenseGuideDown;
+        _activeXInputSlot = activeXInputSlot;
+    }
 
     public void Start()
     {
@@ -39,40 +47,19 @@ public sealed class GuideButtonWatcher : IDisposable
     {
         bool wasPressed = false;
         DateTime pressedAt = DateTime.MinValue;
-        DateTime lastReleaseAt = DateTime.MinValue;
-        int tapCount = 0;
 
         while (_running)
         {
             try
             {
-                bool guideDown = _isEnabled() && IsGuideDownOnAnySlot();
+                bool guideDown = _isEnabled() && (_isDualSenseGuideDown() || IsGuideDown(_activeXInputSlot()));
                 var now = DateTime.UtcNow;
 
                 if (guideDown && !wasPressed)
                     pressedAt = now;
 
                 if (!guideDown && wasPressed && (now - pressedAt).TotalMilliseconds < LongPressThresholdMs)
-                {
-                    if ((now - lastReleaseAt).TotalMilliseconds <= DoubleTapWindowMs)
-                    {
-                        tapCount = 0;
-                        lastReleaseAt = DateTime.MinValue;
-                        Fire("double tap → show desktop", ShowDesktop);
-                    }
-                    else
-                    {
-                        tapCount = 1;
-                        lastReleaseAt = now;
-                    }
-                }
-
-                // Single tap confirmed once the double-tap window has expired.
-                if (tapCount == 1 && (now - lastReleaseAt).TotalMilliseconds > DoubleTapWindowMs)
-                {
-                    tapCount = 0;
-                    Fire("tap → touch keyboard", TouchKeyboard.Toggle);
-                }
+                    Fire("press → keyboard", KeyboardHost.Toggle);
 
                 wasPressed = guideDown;
             }
@@ -104,15 +91,10 @@ public sealed class GuideButtonWatcher : IDisposable
         action();
     }
 
-    private static bool IsGuideDownOnAnySlot()
-    {
-        for (uint i = 0; i < 4; i++)
-        {
-            if (XInputGetStateEx(i, out var state) == 0 && (state.Gamepad.wButtons & GuideButton) != 0)
-                return true;
-        }
-        return false;
-    }
+    private static bool IsGuideDown(int slot)
+        => slot is >= 0 and < 4
+           && XInputGetStateEx((uint)slot, out var state) == 0
+           && (state.Gamepad.wButtons & GuideButton) != 0;
 
     // ── Show desktop ──────────────────────────────────────────────────────
 
@@ -185,6 +167,68 @@ public sealed class GuideButtonWatcher : IDisposable
 /// <summary>Toggles the Windows touch keyboard via TabTip's ITipInvocation COM interface.</summary>
 internal static class TouchKeyboard
 {
+    // ── Visibility (IFrameworkInputPane reports the keyboard's on-screen rectangle) ──
+
+    [ComImport, Guid("D5120AA3-46BA-44C5-822D-CA8092C1FC72")]
+    private class FrameworkInputPane { }
+
+    [ComImport, Guid("5752238B-24F0-495A-82F1-2FD593056796")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFrameworkInputPane
+    {
+        void Advise([MarshalAs(UnmanagedType.IUnknown)] object pWindow, IntPtr pHandler, out int pdwCookie);
+        void AdviseWithHWND(IntPtr hwnd, IntPtr pHandler, out int pdwCookie);
+        void Unadvise(int dwCookie);
+        void Location(out RECT prcInputPaneScreenLocation);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int Left, Top, Right, Bottom; }
+
+    private static volatile bool _visible;
+    private static Thread? _monitor;
+
+    /// <summary>True while the touch keyboard is on screen (updated every 150 ms).</summary>
+    public static bool IsVisible => _visible;
+
+    /// <summary>Starts polling the keyboard's visibility on a background STA thread.</summary>
+    public static void StartMonitor()
+    {
+        if (_monitor != null) return;
+        _monitor = new Thread(() =>
+        {
+            IFrameworkInputPane? pane = null;
+            bool loggedError = false;
+            while (true)
+            {
+                try
+                {
+                    pane ??= (IFrameworkInputPane)new FrameworkInputPane();
+                    pane.Location(out var r);
+                    bool visible = r.Right > r.Left && r.Bottom > r.Top;
+                    if (visible != _visible)
+                    {
+                        _visible = visible;
+                        AppLogger.Log($"Touch keyboard {(visible ? "shown" : "hidden")}.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!loggedError)
+                    {
+                        loggedError = true;
+                        AppLogger.Log($"Touch keyboard visibility check failed: {ex.GetType().Name} 0x{ex.HResult:X8}");
+                    }
+                    pane = null;
+                    _visible = false;
+                }
+                Thread.Sleep(150);
+            }
+        }) { IsBackground = true, Name = "TouchKeyboardMonitor" };
+        _monitor.SetApartmentState(ApartmentState.STA);
+        _monitor.Start();
+    }
+
     [ComImport, Guid("4ce576fa-83dc-4F88-951c-9d0782b4e376")]
     private class UIHostNoLaunch { }
 
@@ -203,6 +247,19 @@ internal static class TouchKeyboard
     [DllImport("user32.dll")] private static extern bool DestroyWindow(IntPtr hWnd);
 
     public static void Toggle()
+    {
+        bool wasVisible = _visible;
+        ToggleCore();
+        // Diagnostics: report toggles that didn't change anything.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(1000);
+            if (_monitor != null && _visible == wasVisible)
+                AppLogger.Log($"Touch keyboard toggle had no effect (still {(wasVisible ? "shown" : "hidden")}).");
+        });
+    }
+
+    private static void ToggleCore()
     {
         IntPtr helperHwnd = IntPtr.Zero;
         try

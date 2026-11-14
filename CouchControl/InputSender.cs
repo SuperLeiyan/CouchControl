@@ -64,6 +64,24 @@ internal sealed class InputSender : IInputSink
         SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
     }
 
+    /// <summary>Types one character, independent of the keyboard layout.</summary>
+    public void Text(char c)
+    {
+        var inputs = new INPUT[2];
+        for (int i = 0; i < 2; i++)
+        {
+            inputs[i] = new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                u = new InputUnion
+                {
+                    ki = new KEYBDINPUT { wVk = 0, wScan = c, dwFlags = KEYEVENTF_UNICODE | (i == 1 ? KEYEVENTF_KEYUP : 0) }
+                }
+            };
+        }
+        SendInput(2, inputs, Marshal.SizeOf<INPUT>());
+    }
+
     private static bool IsExtended(ushort vk) => vk switch
     {
         0x21 or 0x22 or 0x23 or 0x24 => true,           // PgUp, PgDn, End, Home
@@ -92,7 +110,7 @@ internal sealed class InputSender : IInputSink
         MOUSEEVENTF_MIDDLEUP = 0x0040, MOUSEEVENTF_XDOWN = 0x0080, MOUSEEVENTF_XUP = 0x0100,
         MOUSEEVENTF_WHEEL = 0x0800, MOUSEEVENTF_HWHEEL = 0x1000;
     private const uint XBUTTON1 = 1, XBUTTON2 = 2;
-    private const uint KEYEVENTF_EXTENDEDKEY = 0x0001, KEYEVENTF_KEYUP = 0x0002;
+    private const uint KEYEVENTF_EXTENDEDKEY = 0x0001, KEYEVENTF_KEYUP = 0x0002, KEYEVENTF_UNICODE = 0x0004;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }

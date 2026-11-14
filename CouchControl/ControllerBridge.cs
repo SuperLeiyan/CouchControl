@@ -8,7 +8,8 @@ using System.Reflection;
 namespace CouchControl;
 
 /// <summary>
-/// Bridges a physical XInput controller to a ViGEm virtual Xbox 360 controller.
+/// Bridges a physical controller (an XInput pad, or a DualSense read directly over HID)
+/// to a ViGEm virtual Xbox 360 controller, and passes game rumble back to it.
 /// Mute state is controlled by JoyXoff virtual keyboard window detection and
 /// configurable process foreground detection.
 /// </summary>
@@ -113,40 +114,49 @@ public sealed class ControllerBridge : IDisposable
         DesktopModeChanged?.Invoke(active);
     }
 
-    internal static PadState ToPadState(Gamepad gp)
+    internal static PadState ToPadState(ControllerState s)
     {
-        var b = gp.Buttons;
         ushort digital = 0;
-        void Set(GamepadButtonFlags flag, PadButton pad) { if (b.HasFlag(flag)) digital |= (ushort)(1 << (int)pad); }
-        Set(GamepadButtonFlags.A, PadButton.A);
-        Set(GamepadButtonFlags.B, PadButton.B);
-        Set(GamepadButtonFlags.X, PadButton.X);
-        Set(GamepadButtonFlags.Y, PadButton.Y);
-        Set(GamepadButtonFlags.LeftShoulder, PadButton.LB);
-        Set(GamepadButtonFlags.RightShoulder, PadButton.RB);
-        Set(GamepadButtonFlags.Back, PadButton.Back);
-        Set(GamepadButtonFlags.Start, PadButton.Start);
-        Set(GamepadButtonFlags.LeftThumb, PadButton.LS);
-        Set(GamepadButtonFlags.RightThumb, PadButton.RS);
-        Set(GamepadButtonFlags.DPadUp, PadButton.DPadUp);
-        Set(GamepadButtonFlags.DPadDown, PadButton.DPadDown);
-        Set(GamepadButtonFlags.DPadLeft, PadButton.DPadLeft);
-        Set(GamepadButtonFlags.DPadRight, PadButton.DPadRight);
-        return new PadState(gp.LeftThumbX, gp.LeftThumbY, gp.RightThumbX, gp.RightThumbY,
-            gp.LeftTrigger, gp.RightTrigger, digital);
+        void Set(bool down, PadButton pad) { if (down) digital |= (ushort)(1 << (int)pad); }
+        Set(s.A, PadButton.A);
+        Set(s.B, PadButton.B);
+        Set(s.X, PadButton.X);
+        Set(s.Y, PadButton.Y);
+        Set(s.LeftShoulder, PadButton.LB);
+        Set(s.RightShoulder, PadButton.RB);
+        Set(s.Back, PadButton.Back);
+        Set(s.Start, PadButton.Start);
+        Set(s.LeftThumb, PadButton.LS);
+        Set(s.RightThumb, PadButton.RS);
+        Set(s.DPadUp, PadButton.DPadUp);
+        Set(s.DPadDown, PadButton.DPadDown);
+        Set(s.DPadLeft, PadButton.DPadLeft);
+        Set(s.DPadRight, PadButton.DPadRight);
+        return new PadState(s.LeftThumbX, s.LeftThumbY, s.RightThumbX, s.RightThumbY,
+            s.LeftTrigger, s.RightTrigger, digital);
     }
 
     internal const int DeadzoneRaw = 3276;
 
+    /// <summary>Which physical controller is currently driving the virtual pad.</summary>
+    internal enum InputSource { None, XInput, DualSense }
+    private bool _keyboardNav; // poll thread only
+    private bool _oskOpen;     // poll thread only
+    private volatile InputSource _source = InputSource.None;
+
     public bool IsMuted => _isMuted;
     public int VirtualSlot => _virtualSlot;
-    public int PhysicalSlot => _xinput != null ? (int)_xinput.UserIndex : -1;
+    public int PhysicalSlot => _source == InputSource.XInput && _xinput != null ? (int)_xinput.UserIndex : -1;
     public bool DualSenseConnected => _dualSense?.IsConnected == true;
+    public bool DualSenseBluetooth => _dualSense?.IsBluetooth == true;
+    /// <summary>True while the DualSense is the controller in control and its PS button is held.</summary>
+    public bool DualSenseGuideDown => _source == InputSource.DualSense && _dualSense?.GuideDown == true;
+
+    /// <summary>XInput slot of the Xbox controller in control, or -1 if it isn't an Xbox controller.</summary>
+    public int ActiveXInputSlot => _source == InputSource.XInput && _xinput is { } x ? (int)x.UserIndex : -1;
 
     /// <summary>Raised (on a worker thread) when a DualSense touchpad gesture is recognised.</summary>
     public event Action<TouchpadGesture>? TouchpadGestureDetected;
-    public int DualSenseFeedSlot => _dualSense?.FeedSlot ?? -1;
-    public bool DualSenseFeedHidden => _dualSense?.FeedHidden == true;
 
     public bool Initialize()
     {
@@ -158,57 +168,22 @@ public sealed class ControllerBridge : IDisposable
             if (_manageHidHide)
                 HidHideManager.HidePhysicalControllers();
 
-            // Connect virtual controller next.
-            // If CouchControl starts before physical controllers connect (e.g. at Windows startup
-            // via "Start with Windows"), the virtual controller claims slot 0 automatically.
+            // Connect the virtual controller next. XInput gives it the first free slot, so it
+            // only becomes player 1 (slot 0) if no physical pad is on slot 0 yet. If one is,
+            // the run loop moves it to slot 0 once that slot frees up (see ReclaimSlotZero).
             _vigem = new ViGEmClient();
-            _virtual = _vigem.CreateXbox360Controller();
-            _submitReport = _virtual.GetType().GetMethod("SubmitReport",
-                BindingFlags.Public | BindingFlags.Instance);
-            if (_submitReport == null)
-                AppLogger.Log("WARNING: SubmitReport not found.");
-            _virtual.Connect();
-            Thread.Sleep(300);
+            ConnectVirtual();
 
-            // Identify virtual vs physical slots.
-            // ViGEm virtual controllers have no XInput instance ID; physical controllers do.
-            var allSlots = new List<(int slot, Controller ctrl)>();
-            for (int i = 0; i < 4; i++)
-            {
-                var c = new Controller((UserIndex)i);
-                if (c.IsConnected) allSlots.Add((i, c));
-            }
-
-            var physicalControllers = new List<Controller>();
-            foreach (var (slot, ctrl) in allSlots)
-            {
-                var id = FindXInputInstanceId(slot);
-                if (id == null)
-                {
-                    _virtualSlot = slot;
-                    AppLogger.Log($"Virtual controller on slot {slot}.");
-                }
-                else
-                {
-                    physicalControllers.Add(ctrl);
-                    AppLogger.Log($"Physical controller on slot {slot}.");
-                }
-            }
-
-            if (_virtualSlot == -1 && allSlots.Count >= 1)
-            {
-                _virtualSlot = allSlots[0].slot;
-                AppLogger.Log($"Virtual controller on slot {_virtualSlot} (fallback).");
-            }
-
-            _xinput = physicalControllers.Count > 0 ? physicalControllers[0] : FindPhysicalController();
-            if (_xinput == null)
-                AppLogger.Log("No physical controller found. Will retry during run loop.");
+            _xinput = FindPhysicalController();
+            AppLogger.Log(_xinput != null
+                ? $"Physical controller on slot {(int)_xinput.UserIndex}."
+                : "No physical controller found. Will retry during run loop.");
 
             if (_virtualSlot == 0)
                 AppLogger.Log("Virtual controller on slot 0 — all games will see it correctly.");
             else
-                AppLogger.Log($"Virtual controller on slot {_virtualSlot}. Enable 'Start with Windows' in the tray menu for automatic slot 0.");
+                AppLogger.Log($"Virtual controller on slot {_virtualSlot}: a controller was already on slot 0. " +
+                    "Turn it off and on again and CouchControl will move to slot 0.");
 
             // Window watcher — auto-mutes when a configured process is in the foreground
             _windowWatcher = new WindowWatcher(
@@ -225,14 +200,19 @@ public sealed class ControllerBridge : IDisposable
             // while it's on.
             _desktop = new DesktopMapper(InputSender.Instance, RunOneShot, _desktopSettings);
             _desktop.ModeChanged += OnDesktopModeChanged;
-            if (_desktop.IsActive) OnDesktopModeChanged(true);
             AppLogger.Log($"Desktop mode ready (toggle: {_desktopSettings.ToggleChord}).");
 
-            // DualSense → Xbox 360 feed controller. The run loop picks the feed up as a
-            // "physical" XInput pad and mirrors it (with muting) to games.
-            _dualSense = new DualSenseBridge(_vigem, g => TouchpadGestureDetected?.Invoke(g));
+            // DualSense reader. When a DualSense is connected, the run loop uses it in place
+            // of an XInput pad and mirrors it (with muting) to games.
+            _dualSense = new DualSenseBridge(g =>
+            {
+                // Only the controller in control can toggle the keyboard.
+                if (_source == InputSource.DualSense) TouchpadGestureDetected?.Invoke(g);
+            });
             _dualSense.Start();
             AppLogger.Log("DualSense watcher started.");
+
+            TouchKeyboard.StartMonitor();
 
             // Catch controllers that connect later (e.g. when a stream starts).
             _hidHideTimer = new System.Threading.Timer(_ =>
@@ -268,6 +248,116 @@ public sealed class ControllerBridge : IDisposable
         return null;
     }
 
+    /// <summary>Passes rumble from games (sent to the main virtual pad) to the physical controller.</summary>
+    private void OnGameRumble(object? sender, Xbox360FeedbackReceivedEventArgs e)
+    {
+        if (_source == InputSource.DualSense)
+            _dualSense?.SetRumble(e.LargeMotor, e.SmallMotor);
+        else
+            SetPhysicalRumble(_xinput, e.LargeMotor, e.SmallMotor);
+    }
+
+    private static void SetPhysicalRumble(Controller? pad, byte large, byte small)
+    {
+        if (pad == null) return;
+        try
+        {
+            pad.SetVibration(new Vibration
+            {
+                LeftMotorSpeed = (ushort)(large * 257),  // low-frequency (strong) motor
+                RightMotorSpeed = (ushort)(small * 257), // high-frequency (weak) motor
+            });
+        }
+        catch { } // disconnected mid-call; the run loop handles reconnects
+    }
+
+    /// <summary>Creates and connects the virtual controller and works out which slot it got.</summary>
+    private void ConnectVirtual()
+    {
+        var before = ConnectedSlots();
+        var pad = _vigem!.CreateXbox360Controller();
+        _submitReport ??= pad.GetType().GetMethod("SubmitReport", BindingFlags.Public | BindingFlags.Instance);
+        if (_submitReport == null)
+            AppLogger.Log("WARNING: SubmitReport not found.");
+        pad.FeedbackReceived += OnGameRumble;
+        pad.Connect();
+        _virtual = pad;
+
+        // The virtual controller is whichever slot appears after connecting it.
+        _virtualSlot = -1;
+        for (int i = 0; i < 20 && _virtualSlot == -1; i++)
+        {
+            Thread.Sleep(100);
+            var added = ConnectedSlots().Except(before).ToList();
+            if (added.Count > 0) _virtualSlot = added.Min();
+        }
+
+        if (_virtualSlot == -1)
+        {
+            // Fallback: ViGEm virtual controllers have no XInput instance ID; physical ones do.
+            _virtualSlot = ConnectedSlots().FirstOrDefault(s => FindXInputInstanceId(s) == null, -1);
+            AppLogger.Log(_virtualSlot >= 0
+                ? $"Virtual controller on slot {_virtualSlot} (found by instance ID)."
+                : "WARNING: could not tell which slot the virtual controller is on.");
+        }
+        else
+        {
+            AppLogger.Log($"Virtual controller on slot {_virtualSlot}.");
+        }
+    }
+
+    private long _nextSlotZeroCheck;
+
+    /// <summary>
+    /// If the virtual controller isn't on slot 0 and slot 0 has become free (e.g. the
+    /// physical pad holding it was switched off), reconnect the virtual controller so it
+    /// takes slot 0. The physical pad then gets a later slot when it comes back.
+    /// Checked at most once a second on the poll thread.
+    /// </summary>
+    private void ReclaimSlotZero()
+    {
+        if (_virtualSlot <= 0 || _vigem == null) return; // already slot 0, or slot unknown
+        long now = Environment.TickCount64;
+        if (now < _nextSlotZeroCheck) return;
+        _nextSlotZeroCheck = now + 1000;
+        if (new Controller(UserIndex.One).IsConnected) return;
+
+        AppLogger.Log($"Slot 0 is free; moving the virtual controller there from slot {_virtualSlot}.");
+        var old = _virtual;
+        _virtual = null;
+        try
+        {
+            if (old != null)
+            {
+                old.FeedbackReceived -= OnGameRumble;
+                WriteState(old, ControllerState.Neutral);
+                _submitReport?.Invoke(old, null);
+                old.Disconnect();
+            }
+            // Give XInput a moment to release the old slot.
+            for (int i = 0; i < 10 && _virtualSlot >= 0 && new Controller((UserIndex)_virtualSlot).IsConnected; i++)
+                Thread.Sleep(50);
+            ConnectVirtual();
+            if (_xinput != null && (int)_xinput.UserIndex == _virtualSlot) _xinput = null; // stale handle
+            SlotChanged?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"Moving the virtual controller failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Raised (on the poll thread) after the virtual controller moves to another slot.</summary>
+    public event Action? SlotChanged;
+
+    private static List<int> ConnectedSlots()
+    {
+        var slots = new List<int>();
+        for (int i = 0; i < 4; i++)
+            if (new Controller((UserIndex)i).IsConnected) slots.Add(i);
+        return slots;
+    }
+
     private Controller? FindPhysicalController()
     {
         for (int i = 0; i < 4; i++)
@@ -286,7 +376,7 @@ public sealed class ControllerBridge : IDisposable
         {
             switch (name)
             {
-                case "TouchKeyboard": TouchKeyboard.Toggle(); break;
+                case "TouchKeyboard": KeyboardHost.Toggle(); break;
                 case "ShowDesktop": GuideButtonWatcher.ShowDesktop(); break;
             }
         });
@@ -299,36 +389,65 @@ public sealed class ControllerBridge : IDisposable
         {
             try
             {
-                if (_xinput == null || !_xinput.IsConnected)
+                ReclaimSlotZero();
+                if (!TryReadInput(out var raw, out var source))
                 {
-                    if (_xinput != null)
-                    {
-                        AppLogger.Log("Controller disconnected. Waiting for reconnect...");
-                        _xinput = null;
-                        lock (_desktopLock) _desktop?.Reset();
-                    }
-                    _xinput = FindPhysicalController();
-                    if (_xinput == null)
-                    {
-                        await Task.Delay(1000, ct);
-                        continue;
-                    }
-                    AppLogger.Log($"Controller reconnected on slot {(int)_xinput.UserIndex}.");
+                    SetSource(InputSource.None);
+                    pollClock.Restart();
+                    await Task.Delay(250, ct);
+                    continue;
                 }
-
-                _xinput.GetState(out var state);
+                SetSource(source);
 
                 double dt = Math.Clamp(pollClock.Elapsed.TotalSeconds, 0, 0.05);
                 pollClock.Restart();
-                lock (_desktopLock) _desktop?.Update(ToPadState(state.Gamepad), dt);
 
-                ApplyState(_isMuted ? ControllerState.Neutral : BuildReport(state.Gamepad));
+                if (KeyboardHost.BuiltInOpen)
+                {
+                    // CouchControl's on-screen keyboard owns the controller while it's open:
+                    // games get nothing and desktop mode pauses.
+                    if (!_oskOpen)
+                    {
+                        _oskOpen = true;
+                        AppLogger.Log("On-screen keyboard open: controller types on it.");
+                    }
+                    lock (_desktopLock) _desktop?.Suspend(ToPadState(raw));
+                    KeyboardHost.Model.Update(raw, Environment.TickCount64, source == InputSource.DualSense);
+                    ApplyState(ControllerState.Neutral);
+                }
+                else
+                {
+                    if (_oskOpen)
+                    {
+                        _oskOpen = false;
+                        AppLogger.Log("On-screen keyboard closed: controller back to normal.");
+                    }
+
+                    // Windows' touch keyboard (if configured) only sees the virtual pad. While it's
+                    // open, the virtual pad stays live (even when games are muted) and desktop mode
+                    // pauses. This works for a DualSense; Windows cuts off hidden Xbox pads.
+                    bool keyboardNav = TouchKeyboard.IsVisible;
+                    if (keyboardNav != _keyboardNav)
+                    {
+                        _keyboardNav = keyboardNav;
+                        AppLogger.Log(keyboardNav
+                            ? "Touch keyboard open: controller now drives the keyboard."
+                            : "Touch keyboard closed: controller back to normal.");
+                    }
+
+                    lock (_desktopLock)
+                    {
+                        if (keyboardNav) _desktop?.Suspend(ToPadState(raw));
+                        else _desktop?.Update(ToPadState(raw), dt);
+                    }
+
+                    ApplyState(_isMuted && !keyboardNav ? ControllerState.Neutral : ForGames(raw));
+                }
             }
             catch (SharpDX.SharpDXException ex) when (ex.ResultCode.Code == unchecked((int)0x8007001E))
             {
-                AppLogger.Log("Controller disconnected. Waiting for reconnect...");
                 _xinput = null;
-                lock (_desktopLock) _desktop?.Reset();
+                SetSource(InputSource.None);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
@@ -340,14 +459,115 @@ public sealed class ControllerBridge : IDisposable
         }
     }
 
-    internal static ControllerState BuildReport(Gamepad gp)
+    private long _nextXInputScan;
+
+    /// <summary>
+    /// Reads both an XInput pad and a DualSense (if connected) and returns the raw state
+    /// (no deadzone) of the one in use. See <see cref="ChooseSource"/>.
+    /// </summary>
+    private bool TryReadInput(out ControllerState raw, out InputSource source)
+    {
+        // Scanning empty XInput slots is slow, so look for a new pad at most once a second.
+        if ((_xinput == null || !_xinput.IsConnected) && Environment.TickCount64 >= _nextXInputScan)
+        {
+            _xinput = FindPhysicalController();
+            _nextXInputScan = Environment.TickCount64 + 1000;
+        }
+
+        ControllerState xiRaw = default, dsRaw = default;
+        bool xiOk = false;
+        if (_xinput != null && _xinput.IsConnected)
+        {
+            _xinput.GetState(out var state);
+            xiRaw = FromGamepad(state.Gamepad);
+            xiOk = true;
+        }
+        bool dsOk = _dualSense?.TryGetState(out dsRaw) == true;
+
+        // Remember when each controller became available, so the first one wins.
+        long now = Environment.TickCount64;
+        if (xiOk && !_xiWasOk) _xiSince = now;
+        if (dsOk && !_dsWasOk) _dsSince = now;
+        _xiWasOk = xiOk;
+        _dsWasOk = dsOk;
+
+        source = ChooseSource(_source, xiOk, _xiSince, dsOk, _dsSince);
+        raw = source switch
+        {
+            InputSource.XInput => xiRaw,
+            InputSource.DualSense => dsRaw,
+            _ => default,
+        };
+        return source != InputSource.None;
+    }
+
+    private bool _xiWasOk, _dsWasOk;
+    private long _xiSince, _dsSince;
+
+    /// <summary>
+    /// Picks the controller in control when an Xbox pad and a DualSense may both be
+    /// connected. The one in control keeps it until it disconnects, so two people can't
+    /// fight over it; then the other takes over. If neither is in control, the one that
+    /// connected first wins (Xbox on a tie).
+    /// </summary>
+    internal static InputSource ChooseSource(InputSource current,
+        bool xiOk, long xiSince, bool dsOk, long dsSince)
+    {
+        if (current == InputSource.XInput && xiOk) return InputSource.XInput;
+        if (current == InputSource.DualSense && dsOk) return InputSource.DualSense;
+        if (xiOk && dsOk) return dsSince < xiSince ? InputSource.DualSense : InputSource.XInput;
+        if (xiOk) return InputSource.XInput;
+        return dsOk ? InputSource.DualSense : InputSource.None;
+    }
+
+    /// <summary>Handles a controller connecting, disconnecting, or switching.</summary>
+    private void SetSource(InputSource source)
+    {
+        var old = _source;
+        if (source == old) return;
+        _source = source;
+
+        if (old == InputSource.XInput) SetPhysicalRumble(_xinput, 0, 0);
+        // A run that was killed mid-rumble leaves the motors running; start from silence.
+        if (source == InputSource.XInput) SetPhysicalRumble(_xinput, 0, 0);
+        ApplyState(ControllerState.Neutral); // nothing stays pressed for games
+
+        lock (_desktopLock)
+        {
+            _desktop?.Reset();
+            // A newly connected controller always starts in controller (game) mode.
+            if (source != InputSource.None) _desktop?.SetActive(false);
+        }
+
+        AppLogger.Log(source switch
+        {
+            InputSource.DualSense => "Using DualSense.",
+            InputSource.XInput => $"Using Xbox controller on slot {(int)_xinput!.UserIndex}.",
+            _ => "Controller disconnected. Waiting for reconnect...",
+        });
+    }
+
+    /// <summary>State sent to games: deadzone applied, Guide never passed through.</summary>
+    internal static ControllerState ForGames(ControllerState raw) => raw with
+    {
+        LeftThumbX = ApplyDeadzone(raw.LeftThumbX),
+        LeftThumbY = ApplyDeadzone(raw.LeftThumbY),
+        RightThumbX = ApplyDeadzone(raw.RightThumbX),
+        RightThumbY = ApplyDeadzone(raw.RightThumbY),
+        Guide = false,
+    };
+
+    internal static ControllerState BuildReport(Gamepad gp) => ForGames(FromGamepad(gp));
+
+    /// <summary>Raw XInput state as a <see cref="ControllerState"/> (no deadzone).</summary>
+    internal static ControllerState FromGamepad(Gamepad gp)
     {
         var b = gp.Buttons;
         return new ControllerState(
-            LeftThumbX:    ApplyDeadzone(gp.LeftThumbX),
-            LeftThumbY:    ApplyDeadzone(gp.LeftThumbY),
-            RightThumbX:   ApplyDeadzone(gp.RightThumbX),
-            RightThumbY:   ApplyDeadzone(gp.RightThumbY),
+            LeftThumbX:    gp.LeftThumbX,
+            LeftThumbY:    gp.LeftThumbY,
+            RightThumbX:   gp.RightThumbX,
+            RightThumbY:   gp.RightThumbY,
             LeftTrigger:   gp.LeftTrigger,
             RightTrigger:  gp.RightTrigger,
             A:             b.HasFlag(GamepadButtonFlags.A),
@@ -414,8 +634,11 @@ public sealed class ControllerBridge : IDisposable
         _hidHideTimer?.Dispose();
         _windowWatcher?.Stop();
         lock (_desktopLock) _desktop?.Reset(); // release any held keys/buttons
+        SetPhysicalRumble(_xinput, 0, 0);
         _dualSense?.Dispose();
-        HidHideManager.ReleaseAll(); // controllers behave normally once CouchControl exits
+        // Physical controllers deliberately stay hidden after exit (see HidHideManager): this
+        // way nothing gets a chance to open them before CouchControl starts again. Turning off
+        // "Manage HidHide" in the tray un-hides them.
         _virtual?.Disconnect();
         _vigem?.Dispose();
         AppLogger.Log("Cleanup complete.");

@@ -20,10 +20,19 @@ public sealed class AppConfig
     /// <summary>Whether CouchControl starts automatically with Windows.</summary>
     public bool StartWithWindows { get; set; } = false;
 
-    /// <summary>Guide/PS button: tap toggles the touch keyboard, double-tap shows the desktop.</summary>
+    /// <summary>
+    /// Use Windows' touch keyboard instead of CouchControl's on-screen keyboard. Windows' keyboard
+    /// can't be typed on with a hidden Xbox controller (Windows cuts its input off while it's open).
+    /// </summary>
+    public bool UseWindowsTouchKeyboard { get; set; } = false;
+
+    /// <summary>CouchControl's on-screen keyboard: saved size and position.</summary>
+    public KeyboardSettings Keyboard { get; set; } = new();
+
+    /// <summary>Guide/PS button: a press toggles the keyboard.</summary>
     public bool GuideButtonActions { get; set; } = true;
 
-    /// <summary>DualSense touchpad: long touch toggles the touch keyboard, double-tap shows the desktop.</summary>
+    /// <summary>DualSense touchpad: a double tap (touches without clicking) toggles the keyboard.</summary>
     public bool TouchpadGestures { get; set; } = true;
 
     /// <summary>

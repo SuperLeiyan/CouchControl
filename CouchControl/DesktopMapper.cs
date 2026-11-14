@@ -40,7 +40,7 @@ internal sealed class DesktopMapper
         _sink = sink;
         _oneShot = oneShot;
         ApplySettings(settings);
-        IsActive = settings.Enabled && settings.StartInDesktopMode;
+        IsActive = false; // always start in controller (game) mode
     }
 
     public void ApplySettings(DesktopModeSettings settings)
@@ -79,6 +79,19 @@ internal sealed class DesktopMapper
         _prev = 0;
         _chordLatched = _chordUsed = false;
         _triggerL = _triggerR = false;
+    }
+
+    /// <summary>
+    /// Call instead of <see cref="Update"/> while the controller is being used for something
+    /// else (e.g. the touch keyboard). Releases anything held and records the current buttons,
+    /// so buttons still held afterwards don't fire until they're pressed again.
+    /// </summary>
+    public void Suspend(PadState s)
+    {
+        ReleaseAll();
+        _prev = PressedMask(s);
+        _chordLatched = (_prev & _chordMask) == _chordMask && _chordMask != 0;
+        _chordUsed = true;
     }
 
     public void Update(PadState s, double dtSeconds)
