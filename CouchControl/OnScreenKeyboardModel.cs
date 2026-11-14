@@ -85,8 +85,8 @@ internal sealed class OnScreenKeyboardModel
             : k.Label;
 
     public string Hints() => PlayStationLabels
-        ? "✕ type   ○ close   □ ⌫   △ space   Options enter   L1/R1 ← →   L3 shift   L2 ctrl   R2 &123   R3 move"
-        : "A type   B close   X ⌫   Y space   ☰ enter   LB/RB ← →   LS shift   LT ctrl   RT &123   RS move";
+        ? "✕ type   ○ close   □ ⌫   △ space   Options enter   L1/R1 ← → (select with ⇧)   L3 shift   L2 ctrl   R2 &123   R3 move"
+        : "A type   B close   X ⌫   Y space   ☰ enter   LB/RB ← → (select with ⇧)   LS shift   LT ctrl   RT &123   RS move";
 
     /// <summary>Call when the keyboard opens: buttons held right now won't fire.</summary>
     public void OnOpened()
@@ -250,7 +250,7 @@ internal sealed class OnScreenKeyboardModel
     // ── Typing ───────────────────────────────────────────────────────────
 
     private const ushort VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D, VK_SPACE = 0x20,
-        VK_LEFT = 0x25, VK_RIGHT = 0x27, VK_DELETE = 0x2E, VK_LCONTROL = 0xA2;
+        VK_LEFT = 0x25, VK_RIGHT = 0x27, VK_DELETE = 0x2E, VK_LCONTROL = 0xA2, VK_LSHIFT = 0xA0;
 
     private Outcome Activate(OskKey k)
     {
@@ -273,8 +273,8 @@ internal sealed class OnScreenKeyboardModel
             case OskAction.Enter: Tap(VK_RETURN); return Outcome.Changed;
             case OskAction.Space: Tap(VK_SPACE); return Outcome.Changed;
             case OskAction.Tab: Tap(VK_TAB); return Outcome.Changed;
-            case OskAction.Left: Tap(VK_LEFT); return Outcome.Changed;
-            case OskAction.Right: Tap(VK_RIGHT); return Outcome.Changed;
+            case OskAction.Left: TapCursor(VK_LEFT); return Outcome.Changed;
+            case OskAction.Right: TapCursor(VK_RIGHT); return Outcome.Changed;
             case OskAction.Shift:
                 Shift = Shift switch { ShiftMode.Off => ShiftMode.Once, ShiftMode.Once => ShiftMode.Caps, _ => ShiftMode.Off };
                 return Outcome.Changed;
@@ -293,6 +293,22 @@ internal sealed class OnScreenKeyboardModel
     }
 
     /// <summary>Press and release a key, with Ctrl if it's latched (then unlatch it).</summary>
+    /// <summary>
+    /// Cursor left/right. While Shift is on (single or Caps), it selects text (Shift+arrow) and
+    /// Shift stays on, so repeated presses extend the selection. With Ctrl too, it selects by word.
+    /// </summary>
+    private void TapCursor(ushort vk)
+    {
+        if (Shift == ShiftMode.Off) { Tap(vk); return; }
+        var keys = new List<ushort>();
+        if (Ctrl) keys.Add(VK_LCONTROL);
+        keys.Add(VK_LSHIFT);
+        keys.Add(vk);
+        InputSender.Instance.Keys(keys, true);
+        InputSender.Instance.Keys(keys, false);
+        Ctrl = false;
+    }
+
     private void Tap(ushort vk)
     {
         ushort[] keys = Ctrl ? [VK_LCONTROL, vk] : [vk];
