@@ -11,7 +11,8 @@ namespace CouchControl;
 /// Draws <see cref="OnScreenKeyboardModel"/>. A topmost window that never takes focus, so keys
 /// go to the app you're typing in. Mouse clicks on keys work too (right click: corner character).
 /// The right stick moves it for the current session. In edit mode (R3) the right stick moves it,
-/// the left stick resizes it, and leaving edit mode saves both in <see cref="KeyboardSettings"/>.
+/// the left stick resizes it, D-pad ↑/↓ changes transparency and ←/→ makes it narrower/wider.
+/// Leaving edit mode saves all of it in <see cref="KeyboardSettings"/>. Keys scale to fit.
 /// </summary>
 internal sealed class OnScreenKeyboardForm : Form
 {
@@ -32,10 +33,12 @@ internal sealed class OnScreenKeyboardForm : Form
 
     private const float PadRatio = 0.010f, KeyHeightRatio = 0.80f, BarRatio = 0.5f;
     private const int MinWidth = 480;
-    private const double MovePxPerSec = 1400, ResizePxPerSec = 900;
+    private const double MovePxPerSec = 1400, ResizePxPerSec = 900, StretchPxPerSec = 700, OpacityPerSec = 0.6;
+    private const double MinOpacity = 0.3, MaxOpacity = 1.0;
+    private const double MinAspect = 1.8, MaxAspect = 7.0; // width ÷ height, for D-pad stretching
 
-    // Sub-pixel position/size while the stick moves it.
-    private double _x, _y, _w;
+    // Sub-pixel position/size while the sticks move it.
+    private double _x, _y, _w, _h;
     private bool _stickActive, _layoutDirty, _wasEditing;
     private Point? _dragOffset;
 
@@ -49,7 +52,7 @@ internal sealed class OnScreenKeyboardForm : Form
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         BackColor = Background;
-        Opacity = 0.96;
+        Opacity = Math.Clamp(_settings.Opacity, MinOpacity, MaxOpacity);
         Text = "CouchControl Keyboard";
         ResizeRedraw = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
@@ -99,18 +102,20 @@ internal sealed class OnScreenKeyboardForm : Form
     }
 
     /// <summary>
-    /// Puts the keyboard where it was last left, or docks it at the bottom of the monitor of the
+    /// Puts the keyboard where it was last saved, or docks it at the bottom of the monitor of the
     /// window being typed in.
     /// </summary>
     public void PlaceOnScreen()
     {
+        Opacity = Math.Clamp(_settings.Opacity, MinOpacity, MaxOpacity);
         if (_settings.Width >= MinWidth && _settings.Left is int left && _settings.Top is int top)
         {
-            var saved = new Rectangle(left, top, _settings.Width, HeightFor(_settings.Width));
+            int h = _settings.Height > 0 ? _settings.Height : HeightFor(_settings.Width);
+            var saved = new Rectangle(left, top, _settings.Width, h);
             var wa = Screen.FromRectangle(saved).WorkingArea;
             if (wa.IntersectsWith(saved))
             {
-                SetLayout(saved.X, saved.Y, saved.Width, wa);
+                SetLayout(saved.X, saved.Y, saved.Width, saved.Height, wa);
                 return;
             }
         }
@@ -123,18 +128,18 @@ internal sealed class OnScreenKeyboardForm : Form
             width = (int)(width * area.Height * 0.45 / HeightFor(width));
         int height = HeightFor(width);
         int margin = (int)(area.Height * 0.015);
-        SetLayout(area.Left + (area.Width - width) / 2, area.Bottom - height - margin, width, area);
+        SetLayout(area.Left + (area.Width - width) / 2, area.Bottom - height - margin, width, height, area);
     }
 
-    /// <summary>Applies a position and width, kept inside the working area.</summary>
-    private void SetLayout(double x, double y, double width, Rectangle wa)
+    /// <summary>Applies a position and size, kept inside the working area.</summary>
+    private void SetLayout(double x, double y, double width, double height, Rectangle wa)
     {
         width = Math.Clamp(width, Math.Min(MinWidth, wa.Width), wa.Width);
-        int height = HeightFor((int)width);
+        height = Math.Clamp(height, Math.Min(120, wa.Height), wa.Height);
         x = Math.Clamp(x, wa.Left, Math.Max(wa.Left, wa.Right - width));
         y = Math.Clamp(y, wa.Top, Math.Max(wa.Top, wa.Bottom - height));
-        _x = x; _y = y; _w = width;
-        Bounds = new Rectangle((int)Math.Round(x), (int)Math.Round(y), (int)Math.Round(width), height);
+        _x = x; _y = y; _w = width; _h = height;
+        Bounds = new Rectangle((int)Math.Round(x), (int)Math.Round(y), (int)Math.Round(width), (int)Math.Round(height));
     }
 
     private void OnStickTick()
@@ -143,19 +148,21 @@ internal sealed class OnScreenKeyboardForm : Form
         _clock.Restart();
 
         float mx, my, rx, ry;
+        int px, py;
         bool editing;
         lock (_model.Sync)
         {
             (mx, my) = _model.RightStick;
             (rx, ry) = _model.LeftStick; // only non-zero in edit mode
+            (px, py) = _model.EditDPad;  // only non-zero in edit mode
             editing = _model.Editing;
         }
 
         if (editing && !_wasEditing) _layoutDirty = true; // R3 then R3 keeps the current spot too
-        if (_wasEditing && !editing) SaveLayout();        // R3 again: save size and position
+        if (_wasEditing && !editing) SaveLayout();        // R3 again: save size, position, transparency
         _wasEditing = editing;
 
-        if (mx == 0 && my == 0 && rx == 0 && ry == 0)
+        if (mx == 0 && my == 0 && rx == 0 && ry == 0 && px == 0 && py == 0)
         {
             _stickActive = false;
             return;
@@ -164,18 +171,35 @@ internal sealed class OnScreenKeyboardForm : Form
         if (!_stickActive)
         {
             // Start from the real bounds (Windows may have moved/resized us, e.g. a DPI change).
-            _x = Left; _y = Top; _w = Width;
+            _x = Left; _y = Top; _w = Width; _h = Height;
             _stickActive = true;
         }
 
-        if (rx != 0 || ry != 0)
+        var wa = Screen.FromRectangle(Bounds).WorkingArea;
+
+        if (py != 0) // D-pad up: more solid, down: more see-through
+            Opacity = Math.Clamp(Opacity - py * OpacityPerSec * dt, MinOpacity, MaxOpacity);
+
+        if (rx != 0 || ry != 0 || px != 0)
         {
-            // Left stick right / up grows, left / down shrinks; the centre stays put.
-            var wa = Screen.FromRectangle(Bounds).WorkingArea;
-            float grow = Math.Abs(rx) >= Math.Abs(ry) ? rx : ry;
-            double newW = Math.Clamp(_w + grow * ResizePxPerSec * dt, Math.Min(MinWidth, wa.Width), wa.Width);
-            double cx = _x + _w / 2, cy = _y + HeightFor((int)_w) / 2.0;
-            SetLayout(cx - newW / 2, cy - HeightFor((int)newW) / 2.0, newW, wa);
+            double cx = _x + _w / 2, cy = _y + _h / 2;
+            double w = _w, h = _h;
+            if (rx != 0 || ry != 0)
+            {
+                // Left stick right / up grows, left / down shrinks, keeping the shape.
+                float grow = Math.Abs(rx) >= Math.Abs(ry) ? rx : ry;
+                double newW = Math.Clamp(w + grow * ResizePxPerSec * dt, Math.Min(MinWidth, wa.Width), wa.Width);
+                double newH = h * newW / w;
+                if (newH > wa.Height) { newW *= wa.Height / newH; newH = wa.Height; }
+                w = newW; h = newH;
+            }
+            if (px != 0)
+            {
+                // D-pad left / right: narrower / wider, same height.
+                w = Math.Clamp(w + px * StretchPxPerSec * dt,
+                    Math.Max(Math.Min(MinWidth, wa.Width), h * MinAspect), Math.Min(wa.Width, h * MaxAspect));
+            }
+            SetLayout(cx - w / 2, cy - h / 2, w, h, wa); // the centre stays put
         }
 
         if (mx != 0 || my != 0)
@@ -183,7 +207,7 @@ internal sealed class OnScreenKeyboardForm : Form
             // Allow crossing to another monitor: clamp to the whole desktop while moving.
             var desk = SystemInformation.VirtualScreen;
             double nx = Math.Clamp(_x + mx * MovePxPerSec * dt, desk.Left, desk.Right - _w);
-            double ny = Math.Clamp(_y - my * MovePxPerSec * dt, desk.Top, desk.Bottom - Height); // XInput +Y = up
+            double ny = Math.Clamp(_y - my * MovePxPerSec * dt, desk.Top, desk.Bottom - _h); // XInput +Y = up
             _x = nx; _y = ny;
             Location = new Point((int)Math.Round(nx), (int)Math.Round(ny));
         }
@@ -196,6 +220,8 @@ internal sealed class OnScreenKeyboardForm : Form
         if (!_layoutDirty) return;
         _layoutDirty = false;
         _settings.Width = Width;
+        _settings.Height = Height;
+        _settings.Opacity = Math.Round(Opacity, 2);
         _settings.Left = Left;
         _settings.Top = Top;
         _save();
@@ -210,11 +236,13 @@ internal sealed class OnScreenKeyboardForm : Form
         return (int)(2 * pad + keyH * BarRatio + rows * keyH);
     }
 
+    /// <summary>Key width comes from the window width and key height from its height, so keys stretch with it.</summary>
     private (float pad, float unit, float keyH, float barH) Metrics()
     {
-        float pad = ClientSize.Width * PadRatio;
+        int rows = OnScreenKeyboardModel.Pages[0].Length;
+        float pad = Math.Min(ClientSize.Width * PadRatio, ClientSize.Height * 0.03f);
         float unit = (ClientSize.Width - 2 * pad) / (float)OnScreenKeyboardModel.RowUnits;
-        float keyH = unit * KeyHeightRatio;
+        float keyH = Math.Max(1, (ClientSize.Height - 2 * pad) / (rows + BarRatio));
         return (pad, unit, keyH, keyH * BarRatio);
     }
 
@@ -234,7 +262,7 @@ internal sealed class OnScreenKeyboardForm : Form
     private IEnumerable<(int row, int col, OskKey key, RectangleF rect)> KeyRects()
     {
         var (pad, unit, keyH, barH) = Metrics();
-        float gap = unit * 0.08f;
+        float gap = Math.Min(unit, keyH) * 0.08f;
         float top = pad + barH;
         var page = OnScreenKeyboardModel.Pages[_model.Page];
         for (int r = 0; r < page.Length; r++)
@@ -255,9 +283,10 @@ internal sealed class OnScreenKeyboardForm : Form
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-        var (pad, _, keyH, barH) = Metrics();
-        var keyFont = FontFor(keyH * 0.36f);
-        var smallFont = FontFor(keyH * 0.2f);
+        var (pad, unit, keyH, barH) = Metrics();
+        float size = Math.Min(keyH, unit * 1.25f); // text fits narrow keys too
+        var keyFont = FontFor(size * 0.36f);
+        var smallFont = FontFor(size * 0.2f);
         var barFont = FontFor(barH * 0.5f);
         using var centered = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
         using var topRight = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Near };
@@ -284,7 +313,7 @@ internal sealed class OnScreenKeyboardForm : Form
                 bool latched = _model.IsLatched(key);
                 Color fill = highlighted ? Accent : key.Action == OskAction.Char ? KeyColor : SpecialKeyColor;
 
-                using var path = RoundedRect(rect, rect.Height * 0.14f);
+                using var path = RoundedRect(rect, Math.Min(rect.Height, rect.Width) * 0.14f);
                 using (var brush = new SolidBrush(fill)) g.FillPath(brush, path);
                 if (latched && !highlighted)
                     using (var pen = new Pen(Accent, Math.Max(2f, rect.Height * 0.05f))) g.DrawPath(pen, path);

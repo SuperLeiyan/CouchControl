@@ -20,7 +20,7 @@ internal sealed record OskKey(string Label, OskAction Action, double Width = 1, 
 ///   View / touchpad click  Esc
 ///   LS click  Shift (double press: Caps)        LT  letters ⇄ symbols    RT  language (not yet)
 ///   Right stick  move the keyboard (not saved)  RS click  edit mode: right stick moves, left
-///                                                         stick resizes, click again to save
+///       stick resizes, D-pad ↑/↓ transparency, ←/→ narrower/wider; click again to save
 /// </summary>
 internal sealed class OnScreenKeyboardModel
 {
@@ -97,6 +97,9 @@ internal sealed class OnScreenKeyboardModel
     /// <summary>Sticks after the dead zone, -1..1 each axis, +Y = up. Read by the form's timer.</summary>
     public (float X, float Y) RightStick { get; private set; }
     public (float X, float Y) LeftStick { get; private set; }
+
+    /// <summary>D-pad held in edit mode (dx, dy; dy = -1 up): transparency and width. Zero otherwise.</summary>
+    public (int X, int Y) EditDPad { get; private set; }
 
     /// <summary>Set by <see cref="KeyboardHost"/> on the UI thread; read by the poll thread.</summary>
     public volatile bool IsOpen;
@@ -177,8 +180,8 @@ internal sealed class OnScreenKeyboardModel
     {
         if (Editing)
             return PlayStationLabels
-                ? "Edit: right stick move   left stick → bigger, ← smaller   R3 save"
-                : "Edit: right stick move   left stick → bigger, ← smaller   RS save";
+                ? "Edit: right stick move   left stick size   D-pad ↑↓ transparency  ←→ width   R3 save"
+                : "Edit: right stick move   left stick size   D-pad ↑↓ transparency  ←→ width   RS save";
         return PlayStationLabels
             ? "✕ type (hold: corner key)   ○ close   right stick move   R3 edit (saved)   ⇧+L1/R1 select"
             : "A type (hold: corner key)   B close   right stick move   RS edit (saved)   ⇧+LB/RB select";
@@ -196,6 +199,7 @@ internal sealed class OnScreenKeyboardModel
             Ctrl = AltKey = Win = false;
             Editing = false;
             RightStick = LeftStick = (0, 0);
+            EditDPad = (0, 0);
             Row = Math.Min(Row, Pages[0].Length - 1);
             Col = Math.Min(Col, Pages[0][Row].Length - 1);
         }
@@ -232,6 +236,7 @@ internal sealed class OnScreenKeyboardModel
             bool lt = _ltDown ? s.LeftTrigger > TriggerRelease : s.LeftTrigger > TriggerPress;
             RightStick = (Curve(s.RightThumbX), Curve(s.RightThumbY));
             LeftStick = Editing ? (Curve(s.LeftThumbX), Curve(s.LeftThumbY)) : (0, 0);
+            EditDPad = Editing ? DPad(bits) : (0, 0);
 
             if (!_started)
             {
@@ -328,15 +333,19 @@ internal sealed class OnScreenKeyboardModel
         return Math.Sign(v) * t * t;
     }
 
-    /// <summary>D-pad wins; otherwise the left stick's dominant axis (unless it's resizing). dy = -1 means up.</summary>
+    private static (int, int) DPad(ushort bits) =>
+        ((Has(bits, PadButton.DPadRight) ? 1 : 0) - (Has(bits, PadButton.DPadLeft) ? 1 : 0),
+         (Has(bits, PadButton.DPadDown) ? 1 : 0) - (Has(bits, PadButton.DPadUp) ? 1 : 0));
+
+    /// <summary>D-pad wins; otherwise the left stick's dominant axis. Nothing in edit mode. dy = -1 means up.</summary>
     private static (int dx, int dy) Direction(ControllerState s, ushort bits, bool editing)
     {
+        if (editing) return (0, 0); // edit mode: D-pad and left stick adjust the keyboard instead
         if (Has(bits, PadButton.DPadUp)) return (0, -1);
         if (Has(bits, PadButton.DPadDown)) return (0, 1);
         if (Has(bits, PadButton.DPadLeft)) return (-1, 0);
         if (Has(bits, PadButton.DPadRight)) return (1, 0);
 
-        if (editing) return (0, 0);
         int x = s.LeftThumbX, y = s.LeftThumbY;
         if (Math.Max(Math.Abs(x), Math.Abs(y)) < StickThreshold) return (0, 0);
         return Math.Abs(x) >= Math.Abs(y) ? (Math.Sign(x), 0) : (0, -Math.Sign(y)); // XInput +Y = up
