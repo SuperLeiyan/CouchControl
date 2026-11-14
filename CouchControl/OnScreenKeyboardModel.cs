@@ -46,7 +46,7 @@ internal sealed class OnScreenKeyboardModel
     [
         Letters(),
         Symbols("!@#$^&_-=+", ";:()/'\"?"),
-        Symbols("%*`~[]{}<>", "\\|€£¥°§•"),
+        Symbols("%[]{}<>€£¥", "*`°×÷~|\\"),
     ];
 
     /// <summary>Index of the first symbols page.</summary>
