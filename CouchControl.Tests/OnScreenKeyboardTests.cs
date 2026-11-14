@@ -31,6 +31,16 @@ public class OnScreenKeyboardTests
     [Fact]
     public void Pages_HaveTheSameNumberOfRows()
     {
-        Assert.Equal(OnScreenKeyboardModel.Pages[0].Length, OnScreenKeyboardModel.Pages[1].Length);
+        foreach (var page in OnScreenKeyboardModel.Pages)
+            Assert.Equal(OnScreenKeyboardModel.Pages[0].Length, page.Length);
+    }
+
+    [Fact]
+    public void SymbolPages_TypeEveryPrintableAsciiSymbol()
+    {
+        var typed = OnScreenKeyboardModel.Pages.SelectMany(p => p).SelectMany(r => r)
+            .Where(k => k.Action == OskAction.Char).SelectMany(k => new[] { k.Ch, k.Alt }).ToHashSet();
+        foreach (char c in "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+            Assert.Contains(c, typed);
     }
 }

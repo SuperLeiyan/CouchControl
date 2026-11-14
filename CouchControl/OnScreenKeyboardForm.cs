@@ -285,7 +285,8 @@ internal sealed class OnScreenKeyboardForm : Form
                 if (latched && !highlighted)
                     using (var pen = new Pen(Accent, Math.Max(2f, rect.Height * 0.05f))) g.DrawPath(pen, path);
 
-                g.DrawString(_model.LabelOf(key), keyFont, latched && !highlighted ? accentBrush : textBrush, rect, centered);
+                var labelBrush = latched && !highlighted ? accentBrush : _model.IsDimmed(key) && !highlighted ? hintBrush : textBrush;
+                g.DrawString(_model.LabelOf(key), keyFont, labelBrush, rect, centered);
 
                 var inner = RectangleF.Inflate(rect, -rect.Height * 0.08f, -rect.Height * 0.04f);
                 var subBrush = highlighted ? textBrush : hintBrush;

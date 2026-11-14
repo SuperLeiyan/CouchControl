@@ -1,6 +1,6 @@
 namespace CouchControl;
 
-internal enum OskAction { Char, Backspace, Enter, Space, Tab, Esc, Shift, Ctrl, Alt, Win, Page, Left, Right, Language }
+internal enum OskAction { Char, Backspace, Enter, Space, Tab, Esc, Shift, Ctrl, Alt, Win, Page, SymbolsPrev, SymbolsNext, Left, Right, Up, Down, Home, End, Language }
 
 /// <summary>
 /// One key: label, what it does, width in key units, the character for Char keys, and the
@@ -42,7 +42,15 @@ internal sealed class OnScreenKeyboardModel
     private static readonly OskKey Language = new("ENG", OskAction.Language, 1.5);
 
     // Must come after the shared keys above: static fields initialise in source order.
-    public static readonly OskKey[][][] Pages = [Letters(), Symbols()];
+    public static readonly OskKey[][][] Pages =
+    [
+        Letters(),
+        Symbols("!@#$^&_-=+", ";:()/'\"?"),
+        Symbols("%*`~[]{}<>", "\\|€£¥°§•"),
+    ];
+
+    /// <summary>Index of the first symbols page.</summary>
+    public const int SymbolsPage = 1;
 
     private static OskKey[][] Letters() =>
     [
@@ -53,13 +61,15 @@ internal sealed class OnScreenKeyboardModel
             new("Space", OskAction.Space, 5), CursorLeft, CursorRight, Language],
     ];
 
-    private static OskKey[][] Symbols() =>
+    /// <summary>Symbols, two pages switched with ◀ ▶ (like Windows' touch keyboard).</summary>
+    private static OskKey[][] Symbols(string row2, string row3) =>
     [
-        [Esc, .. Chars("1234567890"), Backspace],
-        [TabKey, .. Chars("!@#$%^&*()"), EnterKey],
-        [.. Chars("`~-_=+[]{}\\|/")],
-        [new("ABC", OskAction.Page, 1.5), CtrlKey, C('<'), C('>'),
-            new("Space", OskAction.Space, 5), CursorLeft, CursorRight, Language],
+        [Esc with { Width = 1 }, .. Chars("1234567890"), Backspace with { Width = 2 }],
+        [TabKey with { Width = 1 }, .. Chars(row2), EnterKey with { Width = 2 }],
+        [new("◀", OskAction.SymbolsPrev), new("▶", OskAction.SymbolsNext), .. Chars(row3),
+            new("Home", OskAction.Home), new("∧", OskAction.Up), new("End", OskAction.End)],
+        [new("abc", OskAction.Page, 2), CtrlKey, new("Win", OskAction.Win), new("Alt", OskAction.Alt), C(','),
+            new("Space", OskAction.Space, 3), C('.'), CursorLeft, new("∨", OskAction.Down), CursorRight],
     ];
 
     // ── State (guarded by _lock) ─────────────────────────────────────────
@@ -137,6 +147,14 @@ internal sealed class OnScreenKeyboardModel
         OskAction.Left => PlayStationLabels ? "L1" : "LB",
         OskAction.Right => PlayStationLabels ? "R1" : "RB",
         _ => "",
+    };
+
+    /// <summary>◀ on the first symbols page and ▶ on the second do nothing; draw them dimmed.</summary>
+    public bool IsDimmed(OskKey k) => k.Action switch
+    {
+        OskAction.SymbolsPrev => Page == SymbolsPage,
+        OskAction.SymbolsNext => Page == Pages.Length - 1,
+        _ => false,
     };
 
     public bool IsLatched(OskKey k) => k.Action switch
@@ -357,7 +375,7 @@ internal sealed class OnScreenKeyboardModel
     // ── Typing ───────────────────────────────────────────────────────────
 
     private const ushort VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D, VK_ESCAPE = 0x1B, VK_SPACE = 0x20,
-        VK_LEFT = 0x25, VK_RIGHT = 0x27, VK_DELETE = 0x2E, VK_LWIN = 0x5B,
+        VK_END = 0x23, VK_HOME = 0x24, VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_DOWN = 0x28, VK_DELETE = 0x2E, VK_LWIN = 0x5B,
         VK_LSHIFT = 0xA0, VK_LCONTROL = 0xA2, VK_LMENU = 0xA4;
 
     private Outcome Activate(OskKey k)
@@ -370,23 +388,32 @@ internal sealed class OnScreenKeyboardModel
             case OskAction.Space: Tap(VK_SPACE); break;
             case OskAction.Tab: Tap(VK_TAB); break;
             case OskAction.Esc: Tap(VK_ESCAPE); break;
-            case OskAction.Left: TapCursor(VK_LEFT); break;
-            case OskAction.Right: TapCursor(VK_RIGHT); break;
+            case OskAction.Up: TapCursor(VK_UP); break;
+            case OskAction.Down: TapCursor(VK_DOWN); break;
+            case OskAction.Home: TapCursor(VK_HOME); break;
+            case OskAction.End: TapCursor(VK_END); break;
             case OskAction.Shift: PressShift(); break;
             case OskAction.Ctrl: Ctrl = !Ctrl; break;
             case OskAction.Alt: AltKey = !AltKey; break;
             case OskAction.Win: Win = !Win; break;
-            case OskAction.Page:
-                Page ^= 1;
-                Row = Math.Min(Row, Pages[Page].Length - 1);
-                Col = Math.Min(Col, Pages[Page][Row].Length - 1);
-                break;
+            case OskAction.Left: TapCursor(VK_LEFT); break;
+            case OskAction.Right: TapCursor(VK_RIGHT); break;
+            case OskAction.Page: GoToPage(Page == 0 ? SymbolsPage : 0); break;
+            case OskAction.SymbolsPrev: GoToPage(Math.Max(SymbolsPage, Page - 1)); break;
+            case OskAction.SymbolsNext: GoToPage(Math.Min(Pages.Length - 1, Page + 1)); break;
             case OskAction.Language:
                 AppLogger.Log("On-screen keyboard: other languages aren't supported yet.");
                 return Outcome.None;
             default: return Outcome.None;
         }
         return Outcome.Changed;
+    }
+
+    private void GoToPage(int page)
+    {
+        Page = page;
+        Row = Math.Min(Row, Pages[Page].Length - 1);
+        Col = Math.Min(Col, Pages[Page][Row].Length - 1);
     }
 
     /// <summary>Hold A: the corner character, or Delete on Backspace.</summary>
@@ -439,7 +466,7 @@ internal sealed class OnScreenKeyboardModel
     }
 
     /// <summary>
-    /// Cursor left/right. While Shift is on (single or Caps), it selects text (Shift+arrow) and
+    /// Cursor keys (arrows, Home, End). While Shift is on (single or Caps), it selects text (Shift+arrow) and
     /// Shift stays on, so repeated presses extend the selection. With Ctrl too, it selects by word.
     /// </summary>
     private void TapCursor(ushort vk)
