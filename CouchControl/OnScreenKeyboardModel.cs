@@ -17,7 +17,8 @@ internal sealed record OskKey(string Label, OskAction Action, double Width = 1, 
 ///   D-pad / left stick  move the highlight      A  press the key (hold: corner character)
 ///   B  close            X  Backspace            Y  Space            Menu/Options  Enter
 ///   LB / RB  cursor left / right (select text while Shift is on)
-///   LS click  Shift (double press: Caps)        LT  Ctrl            RT  letters ⇄ symbols
+///   View / touchpad click  Esc
+///   LS click  Shift (double press: Caps)        LT  letters ⇄ symbols    RT  language (not yet)
 ///   Right stick  move the keyboard              RS click  resize mode (right stick resizes,
 ///                                                         click again to save)
 /// </summary>
@@ -142,8 +143,9 @@ internal sealed class OnScreenKeyboardModel
         OskAction.Enter => PlayStationLabels ? "Options" : "☰",
         OskAction.Space => PlayStationLabels ? "△" : "Y",
         OskAction.Shift => PlayStationLabels ? "L3" : "LS",
-        OskAction.Ctrl => PlayStationLabels ? "L2" : "LT",
-        OskAction.Page => PlayStationLabels ? "R2" : "RT",
+        OskAction.Page => PlayStationLabels ? "L2" : "LT",
+        OskAction.Language => PlayStationLabels ? "R2" : "RT",
+        OskAction.Esc => PlayStationLabels ? "▭" : "⧉",
         OskAction.Left => PlayStationLabels ? "L1" : "LB",
         OskAction.Right => PlayStationLabels ? "R1" : "RB",
         _ => "",
@@ -258,8 +260,9 @@ internal sealed class OnScreenKeyboardModel
                 if (_right.Tick(Has(bits, PadButton.RB), nowMs)) outcome |= Activate(CursorRight);
                 if (Pressed(PadButton.LS)) outcome |= Activate(ShiftKey);
                 if (Pressed(PadButton.RS)) { Resizing = !Resizing; outcome |= Outcome.Changed; }
-                if (rt && !_rtDown) outcome |= Activate(new("&123", OskAction.Page));
-                if (lt && !_ltDown) outcome |= Activate(CtrlKey);
+                if (Pressed(PadButton.Back)) outcome |= Activate(Esc); // View / touchpad click
+                if (lt && !_ltDown) outcome |= Activate(new("&123", OskAction.Page));
+                if (rt && !_rtDown) outcome |= Activate(Language);
                 _rtDown = rt;
                 _ltDown = lt;
             }
